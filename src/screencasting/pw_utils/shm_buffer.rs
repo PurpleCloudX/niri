@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::os::fd::AsFd;
 use std::rc::Rc;
 
@@ -9,9 +10,10 @@ use smithay::backend::renderer::element::RenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::reexports::rustix;
-use smithay::utils::{Physical, Scale, Size, Transform};
+use smithay::utils::{Physical, Rectangle, Scale, Size, Transform};
 
 use super::shm_mapping::ShmMapping;
+use crate::render_helpers::readback_damage::ContentStamp;
 use crate::render_helpers::StagingTexture;
 
 const SHM_BYTES_PER_PIXEL: usize = 4;
@@ -21,6 +23,7 @@ pub(super) struct Shmbuf {
     pub(super) fd: Rc<rustix::fd::OwnedFd>,
     pub(super) layout: ShmLayout,
     mapping: Rc<ShmMapping>,
+    content: Rc<RefCell<Option<ContentStamp>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +81,7 @@ pub(super) fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbu
         fd: fd.into(),
         layout,
         mapping,
+        content: Rc::new(RefCell::new(None)),
     })
 }
 
@@ -86,6 +90,8 @@ pub(super) struct ShmReadback {
     mapping: crate::render_helpers::pbo::Readback,
     buffer: Shmbuf,
     context: ContextId<GlesTexture>,
+    stamp: ContentStamp,
+    region: Option<Rectangle<i32, Physical>>,
 }
 
 impl ShmReadback {
@@ -95,14 +101,16 @@ impl ShmReadback {
             "SHM readback renderer changed"
         );
         self.mapping.with_bytes(renderer, |bytes| {
-            ensure!(
-                bytes.len() >= self.buffer.layout.size_usize(),
-                "SHM readback is shorter than the frame"
-            );
-            self.buffer
-                .mapping
-                .copy_frame(&bytes[..self.buffer.layout.size_usize()])
+            if let Some(region) = self.region {
+                self.buffer.mapping.copy_region(
+                    bytes,
+                    self.buffer.layout.stride as usize,
+                    region,
+                )?;
+            }
+            Ok(())
         })?;
+        *self.buffer.content.borrow_mut() = Some(self.stamp);
         Ok(self.buffer)
     }
 }
@@ -118,17 +126,31 @@ pub(super) fn render_to_shmbuf(
     elements: &[impl RenderElement<GlesRenderer>],
 ) -> anyhow::Result<(ShmReadback, Option<rustix::fd::OwnedFd>)> {
     ensure!(buffer.layout.matches(size), "invalid SHM buffer layout");
-    let mapping =
-        staging.render_and_readback(renderer, size, scale, transform, fourcc, elements)?;
+    let previous = buffer.content.borrow().clone();
+    let (mapping, stamp, region) = staging.render_incremental_readback(
+        renderer,
+        size,
+        scale,
+        transform,
+        fourcc,
+        elements,
+        previous.as_ref(),
+    )?;
     // Fence creation follows ReadPixels in the same GL command stream.
-    let fence = EGLFence::create(renderer.egl_context().display()).ok();
-    renderer.with_context(|gl| unsafe { gl.Flush() })?;
-    let fd = fence.and_then(|fence| fence.export().ok());
+    let fd = if region.is_some() {
+        let fence = EGLFence::create(renderer.egl_context().display()).ok();
+        renderer.with_context(|gl| unsafe { gl.Flush() })?;
+        fence.and_then(|fence| fence.export().ok())
+    } else {
+        None
+    };
     Ok((
         ShmReadback {
             mapping,
             buffer: buffer.clone(),
             context: renderer.context_id(),
+            stamp,
+            region,
         },
         fd,
     ))
@@ -142,9 +164,13 @@ pub(super) fn mark_shm_chunk_rendered(chunk: &mut spa_chunk, layout: ShmLayout) 
 }
 
 pub(super) fn clear_shmbuf(shmbuf: &Shmbuf) -> anyhow::Result<()> {
+    *shmbuf.content.borrow_mut() = None;
     shmbuf.mapping.clear();
     Ok(())
 }
+
+#[cfg(test)]
+mod incremental_tests;
 
 #[cfg(test)]
 mod tests {
