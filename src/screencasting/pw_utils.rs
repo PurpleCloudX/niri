@@ -1668,6 +1668,7 @@ struct ShmLayout {
 
 impl ShmLayout {
     fn new(size: Size<u32, Physical>) -> anyhow::Result<Self> {
+        ensure!(size.w > 0 && size.h > 0, "empty SHM frame");
         let stride = size
             .w
             .checked_mul(SHM_BYTES_PER_PIXEL as u32)
@@ -1686,12 +1687,11 @@ impl ShmLayout {
         self.size as usize
     }
 
-    fn matches(self, size: Size<i32, Physical>, stride: i32, buffer_size: usize) -> bool {
-        size.w >= 0
-            && size.h >= 0
-            && self.stride == stride
-            && self.size_usize() == buffer_size
-            && self.stride == size.w.saturating_mul(SHM_BYTES_PER_PIXEL as i32)
+    fn matches(self, size: Size<i32, Physical>) -> bool {
+        let (Ok(width), Ok(height)) = (u32::try_from(size.w), u32::try_from(size.h)) else {
+            return false;
+        };
+        Self::new(Size::from((width, height))).is_ok_and(|layout| layout == self)
     }
 }
 
@@ -1796,11 +1796,7 @@ fn render_to_shmbuf(
     elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
 ) -> anyhow::Result<()> {
     ensure!(
-        buffer.layout.matches(
-            size,
-            size.w.saturating_mul(SHM_BYTES_PER_PIXEL as i32),
-            size.w.max(0) as usize * size.h.max(0) as usize * SHM_BYTES_PER_PIXEL,
-        ),
+        buffer.layout.matches(size),
         "invalid SHM buffer layout"
     );
     let mapping =
@@ -2018,6 +2014,14 @@ mod tests {
 
         assert!(ShmLayout::new(Size::from((536_870_912, 1))).is_err());
         assert!(ShmLayout::new(Size::from((500_000_000, 3))).is_err());
+        assert!(ShmLayout::new(Size::from((0, 1))).is_err());
+        assert!(ShmLayout::new(Size::from((1, 0))).is_err());
+        assert!(layout.matches(Size::from((3840, 2160))));
+        assert!(!layout.matches(Size::from((1920, 4320))));
+        let mut invalid_size = Size::from((1, 2160));
+        invalid_size.w = -1;
+        assert!(!layout.matches(invalid_size));
+        assert!(!layout.matches(Size::from((i32::MAX, i32::MAX))));
     }
 
     #[test]
