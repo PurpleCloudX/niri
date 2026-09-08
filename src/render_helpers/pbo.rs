@@ -196,4 +196,6 @@ pub fn try_readback_region(
 }
 
 #[cfg(test)]
+mod fault_tests;
+#[cfg(test)]
 mod tests;

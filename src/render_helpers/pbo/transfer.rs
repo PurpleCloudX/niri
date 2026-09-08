@@ -106,6 +106,18 @@ pub(super) unsafe fn read(
         tracing::warn!("PBO readback unavailable: OpenGL ES 3 and mapping support required");
         return Ok(None);
     }
+    if allocation.buffer == 0 {
+        for (label, parameter) in [
+            ("vendor", ffi::VENDOR),
+            ("renderer", ffi::RENDERER),
+            ("version", ffi::VERSION),
+        ] {
+            let value = gl.GetString(parameter);
+            if !value.is_null() {
+                tracing::debug!(label, value = %CStr::from_ptr(value.cast()).to_string_lossy(), "readback GL device");
+            }
+        }
+    }
     let state = TransferState::new(gl)?;
     gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, state.framebuffer);
     gl.FramebufferTexture2D(
