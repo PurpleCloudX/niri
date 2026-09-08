@@ -3,6 +3,25 @@ use super::formats::{make_pod, make_video_params_for_initial_negotiation_with_ex
 use super::*;
 
 #[test]
+fn fence_completing_during_failed_export_is_deliverable() {
+    use smithay::backend::renderer::sync::{Fence, Interrupted};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CompletingFence(AtomicBool);
+    impl Fence for CompletingFence {
+        fn is_signaled(&self) -> bool { self.0.load(Ordering::SeqCst) }
+        fn wait(&self) -> Result<(), Interrupted> { panic!("must not block") }
+        fn is_exportable(&self) -> bool { true }
+        fn export(&self) -> Option<std::os::fd::OwnedFd> {
+            self.0.store(true, Ordering::SeqCst);
+            None
+        }
+    }
+    assert!(export_pending_fence(&SyncPoint::from(CompletingFence::default())).unwrap().is_none());
+}
+
+#[test]
 fn failed_fence_export_does_not_imply_gpu_completion() {
     use smithay::backend::renderer::sync::{Fence, Interrupted};
 

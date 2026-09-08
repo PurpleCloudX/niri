@@ -794,7 +794,7 @@ impl Cast {
         }
     }
 
-    unsafe fn queue_after_sync(&mut self, pw_buffer: NonNull<pw_buffer>, sync_point: SyncPoint) {
+    unsafe fn queue_after_sync(&mut self, pw_buffer: NonNull<pw_buffer>, sync_point: SyncPoint) -> bool {
         let _span = tracy_client::span!("Cast::queue_after_sync");
 
         let mut inner = self.inner.borrow_mut();
@@ -807,7 +807,7 @@ impl Cast {
             Err(err) => {
                 warn!("cannot synchronize capture frame: {err:#}");
                 self.stop_after_sync_failure();
-                return;
+                return false;
             }
         };
 
@@ -839,10 +839,12 @@ impl Cast {
                     Err(err) => {
                         warn!("cannot register capture fence: {err}");
                         self.stop_after_sync_failure();
+                        return false;
                     }
                 }
             }
         }
+        true
     }
 
     fn stop_after_sync_failure(&mut self) {
@@ -971,8 +973,7 @@ impl Cast {
                                     SharingBuf::DMA(()),
                                 );
                                 trace!("queueing buffer with seq={}", self.sequence_counter);
-                                self.queue_after_sync(pw_buffer, sync_point);
-                                true
+                                self.queue_after_sync(pw_buffer, sync_point)
                             }
                             Err(err) => {
                                 warn!("error rendering to dmabuf: {err:?}");
@@ -1009,8 +1010,7 @@ impl Cast {
                                     SharingBuf::SHM(&shmbuf),
                                 );
                                 trace!("queueing buffer with seq={}", self.sequence_counter);
-                                self.queue_after_sync(pw_buffer, SyncPoint::signaled());
-                                true
+                                self.queue_after_sync(pw_buffer, SyncPoint::signaled())
                             }
                             Err(err) => {
                                 warn!("error rendering to shmbuf: {err:?}");
@@ -1068,8 +1068,7 @@ impl Cast {
                             SharingBuf::DMA(()),
                         );
                         trace!("queueing clear buffer with seq={}", self.sequence_counter);
-                        self.queue_after_sync(pw_buffer, sync_point);
-                        true
+                        self.queue_after_sync(pw_buffer, sync_point)
                     }
                     Err(err) => {
                         warn!("error clearing dmabuf: {err:?}");
@@ -1102,8 +1101,7 @@ impl Cast {
                             SharingBuf::SHM(&shmbuf),
                         );
                         trace!("queueing clear buffer with seq={}", self.sequence_counter);
-                        self.queue_after_sync(pw_buffer, SyncPoint::signaled());
-                        true
+                        self.queue_after_sync(pw_buffer, SyncPoint::signaled())
                     }
                     Err(err) => {
                         warn!("error clearing shmbuf: {err:?}");
