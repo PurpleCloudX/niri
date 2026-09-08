@@ -4,9 +4,11 @@ use std::rc::Rc;
 use anyhow::{ensure, Context as _};
 use pipewire::spa::sys::{spa_chunk, SPA_CHUNK_FLAG_NONE};
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::egl::fence::EGLFence;
 use smithay::backend::renderer::element::RenderElement;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{GlesMapping, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::ExportMem;
+use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::reexports::rustix;
 use smithay::utils::{Physical, Scale, Size, Transform};
 
@@ -80,6 +82,33 @@ pub(super) fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbu
     })
 }
 
+#[derive(Debug)]
+pub(super) struct ShmReadback {
+    mapping: GlesMapping,
+    buffer: Shmbuf,
+    context: ContextId<GlesTexture>,
+}
+
+impl ShmReadback {
+    pub(super) fn complete(self, renderer: &mut GlesRenderer) -> anyhow::Result<Shmbuf> {
+        ensure!(
+            self.context == renderer.context_id(),
+            "SHM readback renderer changed"
+        );
+        let bytes = renderer
+            .map_texture(&self.mapping)
+            .context("error mapping texture")?;
+        ensure!(
+            bytes.len() >= self.buffer.layout.size_usize(),
+            "SHM readback is shorter than the frame"
+        );
+        self.buffer
+            .mapping
+            .copy_frame(&bytes[..self.buffer.layout.size_usize()])?;
+        Ok(self.buffer)
+    }
+}
+
 pub(super) fn render_to_shmbuf(
     renderer: &mut GlesRenderer,
     staging: &mut StagingTexture,
@@ -89,22 +118,22 @@ pub(super) fn render_to_shmbuf(
     transform: Transform,
     fourcc: Fourcc,
     elements: &[impl RenderElement<GlesRenderer>],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(ShmReadback, Option<rustix::fd::OwnedFd>)> {
     ensure!(buffer.layout.matches(size), "invalid SHM buffer layout");
     let mapping =
         staging.render_and_download(renderer, size, scale, transform, fourcc, elements)?;
-    let bytes = renderer
-        .map_texture(&mapping)
-        .context("error mapping texture")?;
-
-    ensure!(
-        bytes.len() >= buffer.layout.size_usize(),
-        "SHM readback is shorter than the frame"
-    );
-
-    buffer
-        .mapping
-        .copy_frame(&bytes[..buffer.layout.size_usize()])
+    // Fence creation follows ReadPixels in the same GL command stream.
+    let fence = EGLFence::create(renderer.egl_context().display()).ok();
+    renderer.with_context(|gl| unsafe { gl.Flush() })?;
+    let fd = fence.and_then(|fence| fence.export().ok());
+    Ok((
+        ShmReadback {
+            mapping,
+            buffer: buffer.clone(),
+            context: renderer.context_id(),
+        },
+        fd,
+    ))
 }
 
 pub(super) fn mark_shm_chunk_rendered(chunk: &mut spa_chunk, layout: ShmLayout) {
@@ -123,6 +152,70 @@ pub(super) fn clear_shmbuf(shmbuf: &Shmbuf) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use pipewire::spa::sys::SPA_CHUNK_FLAG_CORRUPTED;
+
+    #[test]
+    fn egl_deferred_readback_retains_destination_and_pixels() {
+        use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+        use smithay::backend::egl::{native::EGLSurfacelessDisplay, EGLContext, EGLDisplay};
+        use smithay::backend::renderer::element::Kind;
+        use std::io::Read;
+        use std::time::Duration;
+
+        let mut renderer = unsafe {
+            let display = EGLDisplay::new(EGLSurfacelessDisplay).unwrap();
+            GlesRenderer::new(EGLContext::new(&display).unwrap()).unwrap()
+        };
+        let mut staging = StagingTexture::default();
+        for (color, expected) in [
+            ([1.0, 0.0, 0.0, 1.0], [0, 0, 255, 255]),
+            ([0.0, 1.0, 0.0, 1.0], [0, 255, 0, 255]),
+        ] {
+            let buffer = allocate_shmbuf(Size::from((16, 8))).unwrap();
+            let solid = SolidColorBuffer::new((16.0, 8.0), color);
+            let element =
+                SolidColorRenderElement::from_buffer(&solid, (0.0, 0.0), 1.0, Kind::Unspecified);
+            let (pending, fd) = render_to_shmbuf(
+                &mut renderer,
+                &mut staging,
+                &buffer,
+                Size::from((16, 8)),
+                Scale::from(1.0),
+                Transform::Normal,
+                Fourcc::Argb8888,
+                &[element],
+            )
+            .unwrap();
+            drop(buffer);
+            if let Some(fd) = fd {
+                let mut event_loop = calloop::EventLoop::<bool>::try_new().unwrap();
+                event_loop
+                    .handle()
+                    .insert_source(
+                        calloop::generic::Generic::new(
+                            fd,
+                            calloop::Interest::READ,
+                            calloop::Mode::OneShot,
+                        ),
+                        |_, _, ready| {
+                            *ready = true;
+                            Ok(calloop::PostAction::Remove)
+                        },
+                    )
+                    .unwrap();
+                let mut ready = false;
+                event_loop
+                    .dispatch(Duration::from_secs(5), &mut ready)
+                    .unwrap();
+                assert!(ready, "GPU readback fence did not signal");
+            }
+            let complete = pending.complete(&mut renderer).unwrap();
+            let mut file = std::fs::File::from(complete.fd.try_clone().unwrap());
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes.len(), 16 * 8 * 4);
+            assert!(bytes.chunks_exact(4).all(|pixel| pixel == expected));
+        }
+    }
 
     #[test]
     fn shm_mapping_survives_buffer_clone_and_reuses_storage() {

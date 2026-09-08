@@ -57,6 +57,7 @@ mod modifier_selection;
 mod negotiation;
 mod shm_buffer;
 mod shm_mapping;
+mod shm_readback;
 use shm_buffer::{
     allocate_shmbuf, clear_shmbuf, mark_shm_chunk_rendered, render_to_shmbuf, ShmLayout, Shmbuf,
 };
@@ -124,6 +125,7 @@ struct CastInner {
     /// submitting completed buffers to PipeWire.
     rendering_buffers: Vec<(NonNull<pw_buffer>, SyncPoint)>,
     fence_sources: HashMap<NonNull<pw_buffer>, RegistrationToken>,
+    pending_shm: HashMap<NonNull<pw_buffer>, shm_buffer::ShmReadback>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -327,6 +329,7 @@ impl PipeWire {
             shmbufs: HashMap::new(),
             rendering_buffers: Vec::new(),
             fence_sources: HashMap::new(),
+            pending_shm: HashMap::new(),
         }));
 
         let listener = stream
@@ -534,6 +537,7 @@ impl PipeWire {
                     trace!(%stream_id, "remove_buffer");
                     let mut inner = inner.borrow_mut();
                     if let Some(buffer) = NonNull::new(buffer) {
+                        inner.pending_shm.remove(&buffer);
                         if let Some(token) = inner.fence_sources.remove(&buffer) {
                             event_loop.remove(token);
                         }
@@ -874,6 +878,7 @@ impl Cast {
         self.event_loop.insert_idle(move |state| state.niri.stop_cast(session_id));
     }
 
+
     #[allow(clippy::too_many_arguments)]
     pub fn dequeue_buffer_and_render(
         &mut self,
@@ -884,6 +889,11 @@ impl Cast {
         scale: Scale<f64>,
     ) -> bool {
         let mut inner = self.inner.borrow_mut();
+        if !inner.pending_shm.is_empty() {
+            inner.state.invalidate_damage();
+            inner.waiting_for_buffer = true;
+            return false;
+        }
 
         if let CastState::Ready {
             damage_tracker,
@@ -1023,15 +1033,7 @@ impl Cast {
                             fourcc,
                             elements,
                         ) {
-                            Ok(()) => {
-                                mark_buffer_after_render(
-                                    pw_buffer,
-                                    &mut self.sequence_counter,
-                                    SharingBuf::SHM(&shmbuf),
-                                );
-                                trace!("queueing buffer with seq={}", self.sequence_counter);
-                                self.queue_after_sync(pw_buffer, SyncPoint::signaled())
-                            }
+                            Ok((readback, fence)) => self.submit_shm_readback(pw_buffer, readback, fence, renderer),
                             Err(err) => {
                                 warn!("error rendering to shmbuf: {err:?}");
                                 self.inner.borrow_mut().state.invalidate_damage();
@@ -1050,6 +1052,11 @@ impl Cast {
 
     pub fn dequeue_buffer_and_clear(&mut self, renderer: &mut GlesRenderer) -> bool {
         let mut inner = self.inner.borrow_mut();
+        if !inner.pending_shm.is_empty() {
+            inner.state.invalidate_damage();
+            inner.waiting_for_buffer = true;
+            return false;
+        }
 
         // Clear out the damage tracker if we're in Ready state.
         if let CastState::Ready {
