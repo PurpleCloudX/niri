@@ -184,7 +184,7 @@ pub fn create_texture(
 mod staging;
 pub mod pbo;
 pub mod readback_damage;
-pub use staging::StagingTexture;
+pub use staging::{ReadbackFrame, StagingReadback, StagingTexture};
 
 pub fn copy_framebuffer(
     renderer: &mut GlesRenderer,

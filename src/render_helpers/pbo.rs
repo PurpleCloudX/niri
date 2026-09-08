@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::ptr;
 use std::rc::Rc;
 
 use anyhow::{ensure, Context as _};
@@ -7,6 +6,9 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{ffi, GlesMapping, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{ContextId, ExportMem, Renderer};
 use smithay::utils::{Physical, Rectangle, Size};
+mod pixel_order;
+mod transfer;
+use pixel_order::PixelOrder;
 
 /// One bounded, context-owned GL buffer; shared-context callers use the fallback.
 /// Like the renderer's context resources, GL frees this allocation at context teardown.
@@ -48,6 +50,7 @@ impl Drop for MappingGuard<'_> {
 pub enum Readback {
     Unchanged,
     Smithay(GlesMapping),
+    SmithayRgba(GlesMapping),
     Pooled(PooledReadback),
 }
 
@@ -55,6 +58,7 @@ pub enum Readback {
 pub struct PooledReadback {
     slot: Rc<RefCell<Slot>>,
     len: usize,
+    order: PixelOrder,
 }
 
 impl Drop for PooledReadback {
@@ -73,6 +77,9 @@ impl Readback {
         match self {
             Self::Unchanged => copy(&[]),
             Self::Smithay(mapping) => copy(renderer.map_texture(mapping)?),
+            Self::SmithayRgba(mapping) => {
+                copy(&PixelOrder::Rgba.bgra(renderer.map_texture(mapping)?))
+            }
             Self::Pooled(pending) => {
                 let slot = pending.slot.borrow();
                 ensure!(
@@ -102,7 +109,8 @@ impl Readback {
                         anyhow::bail!("error mapping pooled PBO");
                     }
                     guard.mapped = true;
-                    let result = copy(std::slice::from_raw_parts(pointer.cast(), pending.len));
+                    let bytes = std::slice::from_raw_parts(pointer.cast(), pending.len);
+                    let result = copy(&pending.order.bgra(bytes));
                     ensure!(guard.unmap(), "pooled PBO contents became invalid");
                     result
                 })?
@@ -170,92 +178,21 @@ pub fn try_readback_region(
     {
         return Ok(None);
     }
-    let success = renderer.with_context(|gl| unsafe {
-        if !gl.ReadBuffer.is_loaded() || !gl.MapBufferRange.is_loaded() {
-            allocation.disabled = true;
-            return false;
-        }
-        let mut framebuffer = 0;
-        let mut old_read_fbo = 0;
-        let mut old_pack = 0;
-        let mut old_alignment = 0;
-        let mut old_row_length = 0;
-        let mut old_skip_rows = 0;
-        let mut old_skip_pixels = 0;
-        gl.GetIntegerv(ffi::READ_FRAMEBUFFER_BINDING, &mut old_read_fbo);
-        gl.GetIntegerv(ffi::PIXEL_PACK_BUFFER_BINDING, &mut old_pack);
-        gl.GetIntegerv(ffi::PACK_ALIGNMENT, &mut old_alignment);
-        gl.GetIntegerv(ffi::PACK_ROW_LENGTH, &mut old_row_length);
-        gl.GetIntegerv(ffi::PACK_SKIP_ROWS, &mut old_skip_rows);
-        gl.GetIntegerv(ffi::PACK_SKIP_PIXELS, &mut old_skip_pixels);
-        gl.GenFramebuffers(1, &mut framebuffer);
-        if framebuffer == 0 {
-            return false;
-        }
-        gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, framebuffer);
-        gl.FramebufferTexture2D(
-            ffi::READ_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            texture.tex_id(),
-            0,
-        );
-        let complete =
-            gl.CheckFramebufferStatus(ffi::READ_FRAMEBUFFER) == ffi::FRAMEBUFFER_COMPLETE;
-        if complete {
-            if allocation.buffer == 0 {
-                gl.GenBuffers(1, &mut allocation.buffer);
-            }
-            if allocation.buffer == 0 {
-                gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, old_read_fbo as u32);
-                gl.DeleteFramebuffers(1, &framebuffer);
-                return false;
-            }
-            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, allocation.buffer);
-            if allocation.capacity != capacity {
-                gl.BufferData(
-                    ffi::PIXEL_PACK_BUFFER,
-                    capacity as isize,
-                    ptr::null(),
-                    ffi::STREAM_READ,
-                );
-            }
-            gl.PixelStorei(ffi::PACK_ALIGNMENT, 4);
-            gl.PixelStorei(ffi::PACK_ROW_LENGTH, 0);
-            gl.PixelStorei(ffi::PACK_SKIP_ROWS, 0);
-            gl.PixelStorei(ffi::PACK_SKIP_PIXELS, 0);
-            gl.ReadBuffer(ffi::COLOR_ATTACHMENT0);
-            gl.ReadPixels(
-                region.loc.x,
-                region.loc.y,
-                region.size.w,
-                region.size.h,
-                ffi::BGRA_EXT,
-                ffi::UNSIGNED_BYTE,
-                ptr::null_mut(),
-            );
-        }
-        let error = gl.GetError();
-        if matches!(error, ffi::INVALID_ENUM | ffi::INVALID_OPERATION) {
-            allocation.disabled = true;
-        }
-        gl.PixelStorei(ffi::PACK_ALIGNMENT, old_alignment);
-        gl.PixelStorei(ffi::PACK_ROW_LENGTH, old_row_length);
-        gl.PixelStorei(ffi::PACK_SKIP_ROWS, old_skip_rows);
-        gl.PixelStorei(ffi::PACK_SKIP_PIXELS, old_skip_pixels);
-        gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, old_pack as u32);
-        gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, old_read_fbo as u32);
-        gl.DeleteFramebuffers(1, &framebuffer);
-        complete && error == ffi::NO_ERROR
+    let result = renderer.with_context(|gl| unsafe {
+        transfer::read(gl, &mut allocation, texture, region, capacity)
     })?;
-    if !success {
-        allocation.capacity = 0;
-        return Ok(None);
-    }
+    let order = match result {
+        Ok(Some(order)) => order,
+        Ok(None) => return Ok(None),
+        Err(err) => {
+            allocation.capacity = 0;
+            return Err(err);
+        }
+    };
     allocation.capacity = capacity;
     allocation.busy = true;
     drop(allocation);
-    Ok(Some(Readback::Pooled(PooledReadback { slot, len })))
+    Ok(Some(Readback::Pooled(PooledReadback { slot, len, order })))
 }
 
 #[cfg(test)]

@@ -8,16 +8,33 @@ use smithay::utils::{Physical, Rectangle, Scale, Size, Transform};
 
 use super::{copy_framebuffer, create_texture};
 
+#[derive(Debug, PartialEq)]
+struct TextureKey {
+    size: Size<i32, Physical>,
+    format: Fourcc,
+    renderer: smithay::backend::renderer::ContextId<GlesTexture>,
+    context: *const std::ffi::c_void,
+}
+
+pub struct ReadbackFrame<'a, E> {
+    pub size: Size<i32, Physical>,
+    pub scale: Scale<f64>,
+    pub transform: Transform,
+    pub fourcc: Fourcc,
+    pub elements: &'a [E],
+}
+
+pub struct StagingReadback {
+    pub mapping: super::pbo::Readback,
+    pub stamp: super::readback_damage::ContentStamp,
+    pub region: Option<Rectangle<i32, Physical>>,
+}
+
 /// Reusable GPU staging texture for readback paths such as PipeWire SHM.
 #[derive(Debug, Default)]
 pub struct StagingTexture {
     texture: Option<GlesTexture>,
-    size: Option<(
-        Size<i32, Physical>,
-        Fourcc,
-        smithay::backend::renderer::ContextId<GlesTexture>,
-        *const std::ffi::c_void,
-    )>,
+    size: Option<TextureKey>,
     damage: Option<(Scale<f64>, Transform, OutputDamageTracker)>,
     readback_damage: super::readback_damage::ReadbackDamage,
     #[cfg(test)]
@@ -57,7 +74,22 @@ impl StagingTexture {
         {
             return Ok(readback);
         }
+        self.download_readback(renderer, fourcc)
+    }
+
+    fn download_readback(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        fourcc: Fourcc,
+    ) -> anyhow::Result<super::pbo::Readback> {
         let target = renderer.bind(self.texture.as_mut().unwrap())?;
+        if matches!(fourcc, Fourcc::Argb8888 | Fourcc::Xrgb8888) {
+            return Ok(super::pbo::Readback::SmithayRgba(copy_framebuffer(
+                renderer,
+                &target,
+                Fourcc::Abgr8888,
+            )?));
+        }
         Ok(super::pbo::Readback::Smithay(copy_framebuffer(
             renderer, &target, fourcc,
         )?))
@@ -66,21 +98,24 @@ impl StagingTexture {
     pub fn render_incremental_readback(
         &mut self,
         renderer: &mut GlesRenderer,
-        size: Size<i32, Physical>,
-        scale: Scale<f64>,
-        transform: Transform,
-        fourcc: Fourcc,
-        elements: &[impl RenderElement<GlesRenderer>],
+        frame: ReadbackFrame<'_, impl RenderElement<GlesRenderer>>,
         previous: Option<&super::readback_damage::ContentStamp>,
-    ) -> anyhow::Result<(
-        super::pbo::Readback,
-        super::readback_damage::ContentStamp,
-        Option<Rectangle<i32, Physical>>,
-    )> {
+    ) -> anyhow::Result<StagingReadback> {
+        let ReadbackFrame {
+            size,
+            scale,
+            transform,
+            fourcc,
+            elements,
+        } = frame;
         self.render_texture(renderer, size, scale, transform, fourcc, elements)?;
         let (stamp, region) = self.readback_damage.since(previous, size);
         let Some(region) = region else {
-            return Ok((super::pbo::Readback::Unchanged, stamp, None));
+            return Ok(StagingReadback {
+                mapping: super::pbo::Readback::Unchanged,
+                stamp,
+                region: None,
+            });
         };
         if let Some(readback) = super::pbo::try_readback_region(
             renderer,
@@ -89,12 +124,19 @@ impl StagingTexture {
             fourcc,
             region,
         )? {
-            return Ok((readback, stamp, Some(region)));
+            return Ok(StagingReadback {
+                mapping: readback,
+                stamp,
+                region: Some(region),
+            });
         }
         // Smithay remains the full-frame fallback for unsupported or busy PBOs.
-        let target = renderer.bind(self.texture.as_mut().unwrap())?;
-        let readback = super::pbo::Readback::Smithay(copy_framebuffer(renderer, &target, fourcc)?);
-        Ok((readback, stamp, Some(Rectangle::from_size(size))))
+        let readback = self.download_readback(renderer, fourcc)?;
+        Ok(StagingReadback {
+            mapping: readback,
+            stamp,
+            region: Some(Rectangle::from_size(size)),
+        })
     }
 
     fn render_texture(
@@ -165,14 +207,19 @@ impl StagingTexture {
         size: Size<i32, Physical>,
         fourcc: Fourcc,
     ) -> Result<&mut GlesTexture, GlesError> {
-        let key = (
+        let key = TextureKey {
             size,
-            fourcc,
-            renderer.context_id(),
-            renderer.egl_context().get_context_handle(),
-        );
+            format: fourcc,
+            renderer: renderer.context_id(),
+            context: renderer.egl_context().get_context_handle(),
+        };
         if self.size.as_ref() != Some(&key) {
-            self.texture = Some(create_texture(renderer, size, fourcc)?);
+            let storage_format = if matches!(fourcc, Fourcc::Argb8888 | Fourcc::Xrgb8888) {
+                Fourcc::Abgr8888
+            } else {
+                fourcc
+            };
+            self.texture = Some(create_texture(renderer, size, storage_format)?);
             self.size = Some(key);
             self.damage = None;
             self.readback_damage.reset();

@@ -14,7 +14,7 @@ use smithay::utils::{Physical, Rectangle, Scale, Size, Transform};
 
 use super::shm_mapping::ShmMapping;
 use crate::render_helpers::readback_damage::ContentStamp;
-use crate::render_helpers::StagingTexture;
+use crate::render_helpers::{ReadbackFrame, StagingReadback, StagingTexture};
 
 const SHM_BYTES_PER_PIXEL: usize = 4;
 
@@ -70,8 +70,8 @@ pub(super) fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbu
         rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
     )
     .context("error creating memfd")?;
-    let _ = rustix::fs::ftruncate(&fd, layout.size.into()).context("error set size of the fd")?;
-    let _ = rustix::fs::fcntl_add_seals(
+    rustix::fs::ftruncate(&fd, layout.size.into()).context("error set size of the fd")?;
+    rustix::fs::fcntl_add_seals(
         &fd,
         rustix::fs::SealFlags::SEAL | rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW,
     )
@@ -119,28 +119,28 @@ pub(super) fn render_to_shmbuf(
     renderer: &mut GlesRenderer,
     staging: &mut StagingTexture,
     buffer: &Shmbuf,
-    size: Size<i32, Physical>,
-    scale: Scale<f64>,
-    transform: Transform,
-    fourcc: Fourcc,
-    elements: &[impl RenderElement<GlesRenderer>],
+    frame: ReadbackFrame<'_, impl RenderElement<GlesRenderer>>,
 ) -> anyhow::Result<(ShmReadback, Option<rustix::fd::OwnedFd>)> {
-    ensure!(buffer.layout.matches(size), "invalid SHM buffer layout");
+    ensure!(
+        buffer.layout.matches(frame.size),
+        "invalid SHM buffer layout"
+    );
     let previous = buffer.content.borrow().clone();
-    let (mapping, stamp, region) = staging.render_incremental_readback(
-        renderer,
-        size,
-        scale,
-        transform,
-        fourcc,
-        elements,
-        previous.as_ref(),
-    )?;
+    let StagingReadback {
+        mapping,
+        stamp,
+        region,
+    } = staging.render_incremental_readback(renderer, frame, previous.as_ref())?;
     // Fence creation follows ReadPixels in the same GL command stream.
     let fd = if region.is_some() {
-        let fence = EGLFence::create(renderer.egl_context().display()).ok();
+        let fence = EGLFence::create(renderer.egl_context().display())
+            .context("cannot create SHM completion fence")?;
         renderer.with_context(|gl| unsafe { gl.Flush() })?;
-        fence.and_then(|fence| fence.export().ok())
+        Some(
+            fence
+                .export()
+                .context("SHM readback requires an exportable completion fence")?,
+        )
     } else {
         None
     };
@@ -204,11 +204,13 @@ mod tests {
                 &mut renderer,
                 &mut staging,
                 &buffer,
-                Size::from((dimensions.0 as i32, dimensions.1 as i32)),
-                Scale::from(1.0),
-                Transform::Normal,
-                Fourcc::Argb8888,
-                &[element],
+                crate::render_helpers::ReadbackFrame {
+                    size: Size::from((dimensions.0 as i32, dimensions.1 as i32)),
+                    scale: Scale::from(1.0),
+                    transform: Transform::Normal,
+                    fourcc: Fourcc::Argb8888,
+                    elements: &[element],
+                },
             )
             .unwrap();
             assert_eq!(
@@ -267,11 +269,13 @@ mod tests {
                 &mut renderer,
                 &mut staging,
                 &buffer,
-                Size::from((4, 4)),
-                Scale::from(1.0),
-                Transform::Normal,
-                Fourcc::Argb8888,
-                &[] as &[SolidColorRenderElement],
+                crate::render_helpers::ReadbackFrame {
+                    size: Size::from((4, 4)),
+                    scale: Scale::from(1.0),
+                    transform: Transform::Normal,
+                    fourcc: Fourcc::Argb8888,
+                    elements: &[] as &[SolidColorRenderElement],
+                },
             )
             .unwrap();
             drop(buffer);

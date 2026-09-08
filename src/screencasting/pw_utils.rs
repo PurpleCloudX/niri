@@ -931,21 +931,13 @@ impl Cast {
                             Fourcc::Xrgb8888
                         };
 
-                        match render_to_shmbuf(
-                            renderer,
-                            &mut self.shm_staging,
-                            &shmbuf,
-                            size,
-                            scale,
-                            Transform::Normal,
-                            fourcc,
-                            elements,
-                        ) {
+                        match render_to_shmbuf(renderer, &mut self.shm_staging, &shmbuf, crate::render_helpers::ReadbackFrame { size: size, scale: scale, transform: Transform::Normal, fourcc: fourcc, elements: elements }) {
                             Ok((readback, fence)) => self.submit_shm_readback(pw_buffer, readback, fence, renderer),
                             Err(err) => {
                                 warn!("error rendering to shmbuf: {err:?}");
                                 self.inner.borrow_mut().state.invalidate_damage();
-                                return_unused_buffer(&self.stream, pw_buffer);
+                                self.return_unused_buffer(pw_buffer);
+                                self.stop_after_sync_failure();
                                 false
                             }
                         }

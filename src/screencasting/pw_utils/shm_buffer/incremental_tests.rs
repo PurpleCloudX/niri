@@ -62,11 +62,13 @@ fn egl_incremental_shm_benchmark() {
                         &mut renderer,
                         &mut staging,
                         buffer,
-                        Size::from((1920, 1080)),
-                        Scale::from(1.0),
-                        Transform::Normal,
-                        Fourcc::Argb8888,
-                        &elements,
+                        crate::render_helpers::ReadbackFrame {
+                            size: Size::from((1920, 1080)),
+                            scale: Scale::from(1.0),
+                            transform: Transform::Normal,
+                            fourcc: Fourcc::Argb8888,
+                            elements: &elements,
+                        },
                     )
                     .unwrap();
                     pending.complete(&mut renderer).unwrap();
@@ -159,11 +161,13 @@ fn egl_partial_updates_match_full_frames_across_buffer_rotation() {
             &mut renderer,
             &mut staging,
             buffer,
-            size,
-            scale,
-            transform,
-            Fourcc::Argb8888,
-            &elements,
+            crate::render_helpers::ReadbackFrame {
+                size: size,
+                scale: scale,
+                transform: transform,
+                fourcc: Fourcc::Argb8888,
+                elements: &elements,
+            },
         )
         .unwrap();
         if frame == 7 {
@@ -221,11 +225,13 @@ fn egl_unchanged_destination_skips_readback_but_new_destination_is_initialized()
             &mut renderer,
             &mut staging,
             &buffer,
-            Size::from((16, 8)),
-            Scale::from(1.0),
-            Transform::Normal,
-            Fourcc::Argb8888,
-            &[] as &[SolidColorRenderElement],
+            crate::render_helpers::ReadbackFrame {
+                size: Size::from((16, 8)),
+                scale: Scale::from(1.0),
+                transform: Transform::Normal,
+                fourcc: Fourcc::Argb8888,
+                elements: &[] as &[SolidColorRenderElement],
+            },
         )
         .unwrap();
         assert_eq!(pending.region.is_none(), frame != 0);
@@ -237,11 +243,13 @@ fn egl_unchanged_destination_skips_readback_but_new_destination_is_initialized()
         &mut renderer,
         &mut staging,
         &new_buffer,
-        Size::from((16, 8)),
-        Scale::from(1.0),
-        Transform::Normal,
-        Fourcc::Argb8888,
-        &[] as &[SolidColorRenderElement],
+        crate::render_helpers::ReadbackFrame {
+            size: Size::from((16, 8)),
+            scale: Scale::from(1.0),
+            transform: Transform::Normal,
+            fourcc: Fourcc::Argb8888,
+            elements: &[] as &[SolidColorRenderElement],
+        },
     )
     .unwrap();
     assert_eq!(pending.region, Some(Rectangle::from_size((16, 8).into())));

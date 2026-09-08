@@ -122,7 +122,7 @@ fn egl_pool_reuses_allocation_and_does_not_overwrite_in_flight_pixels() {
     };
     let buffer_id = pending.slot.borrow().buffer;
     let second = submit(&mut renderer, [0.0, 1.0, 0.0, 1.0], (16, 8));
-    assert!(matches!(second, Readback::Smithay(_)));
+    assert!(matches!(second, Readback::SmithayRgba(_)));
     first
         .with_bytes(&mut renderer, |bytes| {
             assert!(bytes.chunks_exact(4).all(|p| p == [0, 0, 255, 255]));

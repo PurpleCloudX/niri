@@ -444,5 +444,5 @@ fn egl_staging_reuses_texture_and_reads_fresh_pixels() {
     staging
         .get_or_create(&mut other, size, Fourcc::Argb8888)
         .unwrap();
-    assert_eq!(staging.size.as_ref().unwrap().2, other.context_id());
+    assert_eq!(staging.size.as_ref().unwrap().renderer, other.context_id());
 }
