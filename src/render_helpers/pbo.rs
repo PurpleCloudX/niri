@@ -6,7 +6,7 @@ use anyhow::{ensure, Context as _};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{ffi, GlesMapping, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{ContextId, ExportMem, Renderer};
-use smithay::utils::{Physical, Size};
+use smithay::utils::{Physical, Rectangle, Size};
 
 /// One bounded, context-owned GL buffer; shared-context callers use the fallback.
 /// Like the renderer's context resources, GL frees this allocation at context teardown.
@@ -46,6 +46,7 @@ impl Drop for MappingGuard<'_> {
 
 #[derive(Debug)]
 pub enum Readback {
+    Unchanged,
     Smithay(GlesMapping),
     Pooled(PooledReadback),
 }
@@ -70,6 +71,7 @@ impl Readback {
         copy: impl FnOnce(&[u8]) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         match self {
+            Self::Unchanged => copy(&[]),
             Self::Smithay(mapping) => copy(renderer.map_texture(mapping)?),
             Self::Pooled(pending) => {
                 let slot = pending.slot.borrow();
@@ -115,15 +117,35 @@ pub fn try_readback(
     size: Size<i32, Physical>,
     format: Fourcc,
 ) -> anyhow::Result<Option<Readback>> {
+    try_readback_region(renderer, texture, size, format, Rectangle::from_size(size))
+}
+
+pub fn try_readback_region(
+    renderer: &mut GlesRenderer,
+    texture: &GlesTexture,
+    size: Size<i32, Physical>,
+    format: Fourcc,
+    region: Rectangle<i32, Physical>,
+) -> anyhow::Result<Option<Readback>> {
     ensure!(size.w > 0 && size.h > 0, "empty PBO readback");
+    ensure!(
+        region.size.w > 0 && region.size.h > 0 && Rectangle::from_size(size).contains_rect(region),
+        "invalid readback region"
+    );
     if !matches!(format, Fourcc::Argb8888 | Fourcc::Xrgb8888) {
         return Ok(None);
     }
-    let len = (size.w as usize)
-        .checked_mul(size.h as usize)
+    let len = (region.size.w as usize)
+        .checked_mul(region.size.h as usize)
         .and_then(|n| n.checked_mul(4))
         .context("PBO size overflow")?;
     isize::try_from(len).context("PBO exceeds addressable size")?;
+    // Keep one frame of storage, so changing damage sizes never reallocates it.
+    let capacity = (size.w as usize)
+        .checked_mul(size.h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .context("PBO capacity overflow")?;
+    isize::try_from(capacity).context("PBO capacity exceeds addressable size")?;
     let context = renderer.context_id();
     let egl_context = renderer.egl_context().get_context_handle();
     let data = renderer.egl_context().user_data();
@@ -190,10 +212,10 @@ pub fn try_readback(
                 return false;
             }
             gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, allocation.buffer);
-            if allocation.capacity != len {
+            if allocation.capacity != capacity {
                 gl.BufferData(
                     ffi::PIXEL_PACK_BUFFER,
-                    len as isize,
+                    capacity as isize,
                     ptr::null(),
                     ffi::STREAM_READ,
                 );
@@ -204,10 +226,10 @@ pub fn try_readback(
             gl.PixelStorei(ffi::PACK_SKIP_PIXELS, 0);
             gl.ReadBuffer(ffi::COLOR_ATTACHMENT0);
             gl.ReadPixels(
-                0,
-                0,
-                size.w,
-                size.h,
+                region.loc.x,
+                region.loc.y,
+                region.size.w,
+                region.size.h,
                 ffi::BGRA_EXT,
                 ffi::UNSIGNED_BYTE,
                 ptr::null_mut(),
@@ -230,7 +252,7 @@ pub fn try_readback(
         allocation.capacity = 0;
         return Ok(None);
     }
-    allocation.capacity = len;
+    allocation.capacity = capacity;
     allocation.busy = true;
     drop(allocation);
     Ok(Some(Readback::Pooled(PooledReadback { slot, len })))
