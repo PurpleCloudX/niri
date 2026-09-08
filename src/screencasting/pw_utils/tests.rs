@@ -3,6 +3,36 @@ use super::formats::{make_pod, make_video_params_for_initial_negotiation_with_ex
 use super::*;
 
 #[test]
+fn rejected_buffer_clears_all_planes_and_can_be_rendered_again() {
+    let mut chunks = [spa_chunk {
+        offset: 16, size: 48, stride: 8, flags: 0,
+    }; 2];
+    let mut data: [spa_data; 2] = unsafe { mem::zeroed() };
+    for (plane, chunk) in data.iter_mut().zip(&mut chunks) {
+        plane.chunk = chunk;
+        plane.maxsize = 64;
+    }
+    let mut spa: spa_buffer = unsafe { mem::zeroed() };
+    spa.n_datas = 2;
+    spa.datas = data.as_mut_ptr();
+    let mut buffer: pw_buffer = unsafe { mem::zeroed() };
+    buffer.buffer = &mut spa;
+    unsafe { mark_buffer_corrupted(NonNull::from(&mut buffer)); }
+    for chunk in &chunks {
+        assert_eq!(chunk.size, 0);
+        assert_eq!(chunk.flags, SPA_CHUNK_FLAG_CORRUPTED as i32);
+        assert_eq!((chunk.offset, chunk.stride), (16, 8));
+    }
+    let mut sequence = 0;
+    unsafe { mark_buffer_after_render(NonNull::from(&mut buffer), &mut sequence, SharingBuf::DMA(())); }
+    for chunk in &chunks {
+        assert_eq!(chunk.size, 48);
+        assert_eq!(chunk.flags, SPA_CHUNK_FLAG_NONE as i32);
+    }
+    assert_eq!(sequence, 1);
+}
+
+#[test]
 fn removing_a_ready_fence_source_closes_fd_and_cancels_callback() {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;

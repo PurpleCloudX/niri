@@ -1101,6 +1101,7 @@ impl Cast {
 
                 if blocks as usize != SHM_BLOCKS {
                     warn!("expected {SHM_BLOCKS} blocks, got {blocks}");
+                    return_unused_buffer(&self.stream, pw_buffer);
                     return false;
                 };
 
@@ -1131,6 +1132,7 @@ impl Cast {
                 }
             } else {
                 warn!("unknown data type in dequeue_buffer_and_clear");
+                return_unused_buffer(&self.stream, pw_buffer);
                 false
             }
         }
@@ -1282,6 +1284,11 @@ fn export_pending_fence(sync: &SyncPoint) -> anyhow::Result<Option<std::os::fd::
 unsafe fn return_unused_buffer(stream: &Stream, pw_buffer: NonNull<pw_buffer>) {
     // pw_stream_return_buffer() requires too new PipeWire (1.4.0). So, mark as
     // corrupted and queue.
+    mark_buffer_corrupted(pw_buffer);
+    pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer.as_ptr());
+}
+
+unsafe fn mark_buffer_corrupted(pw_buffer: NonNull<pw_buffer>) {
     let pw_buffer = pw_buffer.as_ptr();
     let spa_buffer = (*pw_buffer).buffer;
     // Some (older?) consumers will check for size == 0 instead of the CORRUPTED flag.
@@ -1295,8 +1302,6 @@ unsafe fn return_unused_buffer(stream: &Stream, pw_buffer: NonNull<pw_buffer>) {
         let header = header.as_ptr();
         (*header).flags = SPA_META_HEADER_FLAG_CORRUPTED;
     }
-
-    pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer);
 }
 
 unsafe fn mark_buffer_after_render(
