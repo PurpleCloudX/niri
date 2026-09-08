@@ -1649,10 +1649,18 @@ fn allocate_dmabuf(
     fourcc: Fourcc,
     modifier: Modifier,
 ) -> anyhow::Result<Dmabuf> {
-    let (buffer, _modifier) = allocate_buffer(gbm, size, fourcc, &[u64::from(modifier) as i64])?;
+    let (buffer, allocated_modifier) =
+        allocate_buffer(gbm, size, fourcc, &[u64::from(modifier) as i64])?;
+    ensure!(
+        allocated_modifier == modifier,
+        "allocated DMA-BUF modifier differs from negotiated modifier"
+    );
     let dmabuf = buffer
         .export()
         .context("error exporting GBM buffer object as dmabuf")?;
+    for stride in dmabuf.strides() {
+        i32::try_from(stride).context("DMA-BUF stride exceeds SPA i32")?;
+    }
     Ok(dmabuf)
 }
 
@@ -1679,6 +1687,8 @@ impl ShmLayout {
         let buffer_size = stride
             .checked_mul(size.h)
             .context("SHM buffer size overflows u32")?;
+        // Smithay GLES readback calculates the byte length using signed i32 arithmetic.
+        i32::try_from(buffer_size).context("SHM frame exceeds GLES readback limit")?;
 
         Ok(Self {
             stride: stride.try_into().context("SHM stride exceeds i32")?,
