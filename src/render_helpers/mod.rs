@@ -181,6 +181,28 @@ pub fn create_texture(
     renderer.create_buffer(fourcc, buffer_size)
 }
 
+/// Reusable GPU staging texture for readback paths such as PipeWire SHM.
+#[derive(Debug, Default)]
+pub struct StagingTexture {
+    texture: Option<GlesTexture>,
+    size: Option<(Size<i32, Physical>, Fourcc)>,
+}
+
+impl StagingTexture {
+    pub fn get_or_create(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        size: Size<i32, Physical>,
+        fourcc: Fourcc,
+    ) -> Result<&mut GlesTexture, GlesError> {
+        if self.size != Some((size, fourcc)) {
+            self.texture = Some(create_texture(renderer, size, fourcc)?);
+            self.size = Some((size, fourcc));
+        }
+        Ok(self.texture.as_mut().expect("staging texture was created"))
+    }
+}
+
 pub fn copy_framebuffer(
     renderer: &mut GlesRenderer,
     target: &GlesTarget,
