@@ -6,6 +6,86 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::ExportMem;
 
 #[test]
+#[ignore = "manual EGL render/readback microbenchmark, not an end-to-end latency test"]
+fn egl_staging_benchmark() {
+    fn measure(renderer: &mut GlesRenderer, cached: bool) -> std::time::Duration {
+        let size = Size::from((1920, 1080));
+        let mut staging = StagingTexture::default();
+        let background = SolidColorBuffer::new((1920.0, 1080.0), [0.0, 0.0, 1.0, 1.0]);
+        let mut foreground = SolidColorBuffer::new((64.0, 64.0), [1.0, 0.0, 0.0, 1.0]);
+        let mut destination = vec![0; 1920 * 1080 * 4];
+        let mut total = std::time::Duration::ZERO;
+        for frame in 0..70 {
+            foreground.set_color(if frame % 2 == 0 {
+                [1.0, 0.0, 0.0, 1.0]
+            } else {
+                [0.0, 1.0, 0.0, 1.0]
+            });
+            let elements = [
+                SolidColorRenderElement::from_buffer(
+                    &foreground,
+                    (0.0, 0.0),
+                    1.0,
+                    Kind::Unspecified,
+                ),
+                SolidColorRenderElement::from_buffer(
+                    &background,
+                    (0.0, 0.0),
+                    1.0,
+                    Kind::Unspecified,
+                ),
+            ];
+            let start = std::time::Instant::now();
+            let mapping = if cached {
+                staging
+                    .render_and_download(
+                        renderer,
+                        size,
+                        Scale::from(1.0),
+                        Transform::Normal,
+                        Fourcc::Argb8888,
+                        &elements,
+                    )
+                    .unwrap()
+            } else {
+                crate::render_helpers::render_and_download(
+                    renderer,
+                    size,
+                    Scale::from(1.0),
+                    Transform::Normal,
+                    Fourcc::Argb8888,
+                    elements.iter().rev(),
+                )
+                .unwrap()
+            };
+            destination.copy_from_slice(renderer.map_texture(&mapping).unwrap());
+            std::hint::black_box(&destination);
+            if frame >= 10 {
+                total += start.elapsed();
+            }
+        }
+        total
+    }
+    let mut renderer = unsafe {
+        let display = EGLDisplay::new(EGLSurfacelessDisplay).unwrap();
+        GlesRenderer::new(EGLContext::new(&display).unwrap()).unwrap()
+    };
+    for round in 0..3 {
+        let (baseline, cached) = if round % 2 == 0 {
+            (measure(&mut renderer, false), measure(&mut renderer, true))
+        } else {
+            let cached = measure(&mut renderer, true);
+            (measure(&mut renderer, false), cached)
+        };
+        eprintln!(
+            "round={round} full_ms_per_frame={:.3} cached_ms_per_frame={:.3}",
+            baseline.as_secs_f64() * 1000.0 / 60.0,
+            cached.as_secs_f64() * 1000.0 / 60.0
+        );
+    }
+}
+
+#[test]
 fn egl_staging_preserves_unchanged_pixels_and_invalidates_geometry() {
     let mut renderer = unsafe {
         let display = EGLDisplay::new(EGLSurfacelessDisplay).unwrap();
