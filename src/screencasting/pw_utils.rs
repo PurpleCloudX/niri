@@ -799,28 +799,17 @@ impl Cast {
 
         let mut inner = self.inner.borrow_mut();
 
-        let mut sync_point = sync_point;
-        let sync_fd = match sync_point.export() {
-            Some(sync_fd) => Some(sync_fd),
-            None => {
-                // There are two main ways this can happen. First is that the SyncPoint is
-                // pre-signalled, then the buffer is already ready and no waiting is needed. Second
-                // is that the SyncPoint is potentially still not signalled, but exporting a fence
-                // fd had failed. In this case, there's not much we can do (perhaps do a blocking
-                // wait for the SyncPoint, which itself might fail).
-                //
-                // So let's hope for the best and mark the buffer as submittable. We do not reuse
-                // the original SyncPoint because if we do hit the second case (when it's not
-                // signalled), then without a sync fd we cannot schedule a queue upon its
-                // completion, effectively going stuck. It's better to queue an incomplete buffer
-                // than getting stuck.
-                sync_point = SyncPoint::signaled();
-                None
-            }
-        };
-
+        let sync_fd = export_pending_fence(&sync_point);
         inner.rendering_buffers.push((pw_buffer, sync_point));
         drop(inner);
+        let sync_fd = match sync_fd {
+            Ok(fd) => fd,
+            Err(err) => {
+                warn!("cannot synchronize capture frame: {err:#}");
+                self.stop_after_sync_failure();
+                return;
+            }
+        };
 
         match sync_fd {
             None => {
@@ -842,11 +831,25 @@ impl Cast {
                         }
 
                         Ok(PostAction::Remove)
-                    })
-                    .unwrap();
-                self.inner.borrow_mut().fence_sources.insert(pw_buffer, token);
+                    });
+                match token {
+                    Ok(token) => {
+                        self.inner.borrow_mut().fence_sources.insert(pw_buffer, token);
+                    }
+                    Err(err) => {
+                        warn!("cannot register capture fence: {err}");
+                        self.stop_after_sync_failure();
+                    }
+                }
             }
         }
+    }
+
+    fn stop_after_sync_failure(&mut self) {
+        self.inner.borrow_mut().is_active = false;
+        let session_id = self.session_id;
+        // Rendering temporarily moves casts out of State, so defer disconnection.
+        self.event_loop.insert_idle(move |state| state.niri.stop_cast(session_id));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1245,6 +1248,17 @@ fn allocate_dmabuf(
 enum SharingBuf<'a> {
     DMA(()),
     SHM(&'a Shmbuf),
+}
+
+fn export_pending_fence(sync: &SyncPoint) -> anyhow::Result<Option<std::os::fd::OwnedFd>> {
+    if sync.is_reached() {
+        return Ok(None);
+    }
+    if let Some(fd) = sync.export() {
+        return Ok(Some(fd));
+    }
+    ensure!(sync.is_reached(), "unfinished GPU fence cannot be exported");
+    Ok(None)
 }
 
 unsafe fn return_unused_buffer(stream: &Stream, pw_buffer: NonNull<pw_buffer>) {

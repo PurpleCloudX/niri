@@ -3,6 +3,24 @@ use super::formats::{make_pod, make_video_params_for_initial_negotiation_with_ex
 use super::*;
 
 #[test]
+fn failed_fence_export_does_not_imply_gpu_completion() {
+    use smithay::backend::renderer::sync::{Fence, Interrupted};
+
+    #[derive(Debug)]
+    struct UnexportableFence(bool);
+    impl Fence for UnexportableFence {
+        fn is_signaled(&self) -> bool { self.0 }
+        fn wait(&self) -> Result<(), Interrupted> { panic!("must not block the compositor") }
+        fn is_exportable(&self) -> bool { false }
+        fn export(&self) -> Option<std::os::fd::OwnedFd> { None }
+    }
+
+    assert!(export_pending_fence(&SyncPoint::from(UnexportableFence(false))).is_err());
+    assert!(export_pending_fence(&SyncPoint::from(UnexportableFence(true))).unwrap().is_none());
+    assert!(export_pending_fence(&SyncPoint::signaled()).unwrap().is_none());
+}
+
+#[test]
 fn invalidating_an_undelivered_frame_restores_static_scene_damage() {
     use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
     use smithay::backend::renderer::element::Kind;
