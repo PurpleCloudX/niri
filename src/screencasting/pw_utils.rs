@@ -123,6 +123,7 @@ struct CastInner {
     /// stored in order from oldest to newest, and the same ordering should be preserved when
     /// submitting completed buffers to PipeWire.
     rendering_buffers: Vec<(NonNull<pw_buffer>, SyncPoint)>,
+    fence_sources: HashMap<NonNull<pw_buffer>, RegistrationToken>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -325,6 +326,7 @@ impl PipeWire {
             dmabufs: HashMap::new(),
             shmbufs: HashMap::new(),
             rendering_buffers: Vec::new(),
+            fence_sources: HashMap::new(),
         }));
 
         let listener = stream
@@ -522,9 +524,15 @@ impl PipeWire {
             })
             .remove_buffer({
                 let inner = inner.clone();
+                let event_loop = self.event_loop.clone();
                 move |_stream, (), buffer| {
                     trace!(%stream_id, "remove_buffer");
                     let mut inner = inner.borrow_mut();
+                    if let Some(buffer) = NonNull::new(buffer) {
+                        if let Some(token) = inner.fence_sources.remove(&buffer) {
+                            event_loop.remove(token);
+                        }
+                    }
 
                     inner
                         .rendering_buffers
@@ -773,7 +781,12 @@ impl Cast {
             .position(|(_, sync)| !sync.is_reached())
             .unwrap_or(inner.rendering_buffers.len());
 
-        for (buffer, _) in inner.rendering_buffers.drain(..first_in_progress_idx) {
+        let CastInner { rendering_buffers, fence_sources, .. } = &mut *inner;
+        for (buffer, _) in rendering_buffers.drain(..first_in_progress_idx) {
+            // A previous fence can complete several frames before their own callbacks run.
+            if let Some(token) = fence_sources.remove(&buffer) {
+                self.event_loop.remove(token);
+            }
             trace!("queueing completed buffer");
             unsafe {
                 pw_stream_queue_buffer(self.stream.as_raw_ptr(), buffer.as_ptr());
@@ -819,10 +832,11 @@ impl Cast {
                 trace!("scheduling buffer to queue");
                 let stream_id = self.stream_id;
                 let source = Generic::new(sync_fd, Interest::READ, Mode::OneShot);
-                self.event_loop
+                let token = self.event_loop
                     .insert_source(source, move |_, _, state| {
                         for cast in &mut state.niri.casting.casts {
                             if cast.stream_id == stream_id {
+                                cast.inner.borrow_mut().fence_sources.remove(&pw_buffer);
                                 cast.queue_completed_buffers();
                             }
                         }
@@ -830,6 +844,7 @@ impl Cast {
                         Ok(PostAction::Remove)
                     })
                     .unwrap();
+                self.inner.borrow_mut().fence_sources.insert(pw_buffer, token);
             }
         }
     }
@@ -1097,6 +1112,15 @@ impl Cast {
                 warn!("unknown data type in dequeue_buffer_and_clear");
                 false
             }
+        }
+    }
+}
+
+impl Drop for Cast {
+    fn drop(&mut self) {
+        self.remove_scheduled_redraw();
+        for (_, token) in self.inner.borrow_mut().fence_sources.drain() {
+            self.event_loop.remove(token);
         }
     }
 }
