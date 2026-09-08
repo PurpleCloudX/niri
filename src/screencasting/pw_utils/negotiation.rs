@@ -127,13 +127,15 @@ pub(super) fn listener(
         let maybe_prop_modifier =
             object.find_prop(spa::utils::Id(FormatProperties::VideoModifier.0));
 
-        if (dma_failed || matches!(
-            *state,
-            CastState::ConfirmationPending {
-                extra_negotiation_result: None,
-                ..
-            }
-        )) && maybe_prop_modifier.is_some()
+        if (dma_failed
+            || matches!(
+                *state,
+                CastState::ConfirmationPending {
+                    extra_negotiation_result: None,
+                    ..
+                }
+            ))
+            && maybe_prop_modifier.is_some()
         {
             warn!("consumer returned DMA-BUF after SHM-only negotiation");
             stop_cast();
@@ -193,13 +195,8 @@ pub(super) fn listener(
                     }),
                 };
 
-                let o = make_video_params(
-                    &vec![format.format()],
-                    &vec![modifier],
-                    format_size,
-                    refresh,
-                    true,
-                );
+                let o =
+                    make_video_params(&[format.format()], &[modifier], format_size, refresh, true);
                 let mut b = Vec::new();
                 let pod = make_pod(&mut b, o);
                 let params_1 = vec![pod];

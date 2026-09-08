@@ -11,13 +11,13 @@ use smithay::reexports::gbm::Modifier;
 use smithay::utils::{Physical, Size};
 
 pub(super) fn make_video_params(
-    video_formats: &Vec<VideoFormat>,
-    modifiers: &Vec<Modifier>,
+    video_formats: &[VideoFormat],
+    modifiers: &[Modifier],
     size: Size<u32, Physical>,
     refresh: u32,
     fixated: bool,
 ) -> pod::Object {
-    let modifier_property = if modifiers.len() == 0 {
+    let modifier_property = if modifiers.is_empty() {
         None
     } else {
         let dont_fixate = if modifier_choice_needs_fixation(fixated, modifiers) {
@@ -125,9 +125,9 @@ pub(super) fn make_video_params_for_initial_negotiation_with_extra_buffer(
 
         trace!("offering: {modifiers:?}");
 
-        if modifiers.len() == 0 {
+        if modifiers.is_empty() {
             vec![(
-                make_video_params(&video_formats, &vec![], size, refresh, false),
+                make_video_params(&video_formats, &[], size, refresh, false),
                 Vec::new(),
             )]
         } else {
@@ -137,18 +137,17 @@ pub(super) fn make_video_params_for_initial_negotiation_with_extra_buffer(
                     Vec::new(),
                 ),
                 (
-                    make_video_params(&video_formats, &vec![], size, refresh, false),
+                    make_video_params(&video_formats, &[], size, refresh, false),
                     Vec::new(),
                 ),
             ]
         }
     };
-    let pod_objects_with_extra_buffer = if alpha {
+    if alpha {
         [f(true), f(false)].concat()
     } else {
         f(false)
-    };
-    pod_objects_with_extra_buffer
+    }
 }
 
 macro_rules! make_video_params_for_initial_negotiation_macro {
