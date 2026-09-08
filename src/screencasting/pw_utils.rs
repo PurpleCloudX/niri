@@ -609,6 +609,14 @@ impl PipeWire {
                     let object = pod.as_object().unwrap();
                     let maybe_prop_modifier = object.find_prop(spa::utils::Id(FormatProperties::VideoModifier.0));
 
+                    if matches!(*state, CastState::ConfirmationPending { extra_negotiation_result: None, .. })
+                        && maybe_prop_modifier.is_some()
+                    {
+                        warn!("consumer returned DMA-BUF after SHM-only negotiation");
+                        stop_cast();
+                        return;
+                    }
+
                     match maybe_prop_modifier {
                         Some(prop_modifier) if prop_modifier.flags().contains(PodPropFlags::DONT_FIXATE) => {
                             debug!("fixating the modifier");
@@ -637,7 +645,10 @@ impl PipeWire {
                                 Ok(x) => x,
                                 Err(err) => {
                                     warn!("couldn't find preferred modifier: {err:?}");
-                                    stop_cast();
+                                    if let Err(err) = request_shm_fallback(stream, state, format_size, format_has_alpha, refresh) {
+                                        warn!("error negotiating SHM fallback: {err:?}");
+                                        stop_cast();
+                                    }
                                     return;
                                 }
                             };
@@ -733,7 +744,10 @@ impl PipeWire {
                                                 Ok(x) => x,
                                                 Err(err) => {
                                                     warn!("test allocation failed: {err:?}");
-                                                    stop_cast();
+                                                    if let Err(err) = request_shm_fallback(stream, state, format_size, format_has_alpha, refresh) {
+                                                        warn!("error negotiating SHM fallback: {err:?}");
+                                                        stop_cast();
+                                                    }
                                                     return;
                                                 }
                                             };
@@ -1595,6 +1609,36 @@ fn make_pod(buffer: &mut Vec<u8>, object: pod::Object) -> &Pod {
     Pod::from_bytes(buffer).unwrap()
 }
 
+fn request_shm_fallback(
+    stream: &Stream,
+    state: &mut CastState,
+    size: Size<u32, Physical>,
+    alpha: bool,
+    refresh: u32,
+) -> anyhow::Result<()> {
+    ShmLayout::new(size)?;
+    *state = CastState::ConfirmationPending {
+        size,
+        alpha,
+        extra_negotiation_result: None,
+    };
+    // An empty format set advertises only modifier-less MemFd alternatives.
+    let mut objects = make_video_params_for_initial_negotiation_with_extra_buffer(
+        &FormatSet::default(),
+        size,
+        refresh,
+        alpha,
+    );
+    let mut params: Vec<_> = objects
+        .iter_mut()
+        .map(|(object, bytes)| make_pod(bytes, object.clone()))
+        .collect();
+    debug!(?size, alpha, "retrying negotiation with SHM only");
+    stream
+        .update_params(&mut params)
+        .context("error publishing SHM-only formats")
+}
+
 fn find_preferred_modifier(
     gbm: &GbmDevice<DrmDeviceFd>,
     size: Size<u32, Physical>,
@@ -1987,6 +2031,37 @@ fn clear_shmbuf(shmbuf: &Shmbuf) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shm_only_offer_excludes_modifiers_and_preserves_alpha_alternatives() {
+        for alpha in [false, true] {
+            let mut objects = make_video_params_for_initial_negotiation_with_extra_buffer(
+                &FormatSet::default(),
+                Size::from((1920, 1080)),
+                60_000,
+                alpha,
+            );
+            assert_eq!(objects.len(), if alpha { 2 } else { 1 });
+            for (index, (object, bytes)) in objects.iter_mut().enumerate() {
+                let pod = make_pod(bytes, object.clone());
+                assert!(pod
+                    .as_object()
+                    .unwrap()
+                    .find_prop(spa::utils::Id(FormatProperties::VideoModifier.0))
+                    .is_none());
+                let mut format = VideoInfoRaw::new();
+                format.parse(pod).unwrap();
+                assert_eq!(
+                    format.format(),
+                    if alpha && index == 0 {
+                        VideoFormat::BGRA
+                    } else {
+                        VideoFormat::BGRx
+                    }
+                );
+            }
+        }
+    }
 
     #[test]
     fn rendered_dma_buffer_restores_every_plane_without_changing_layout() {
