@@ -44,6 +44,7 @@ impl Cast {
             let token = self.event_loop.insert_source(
                 Generic::new(fd, Interest::READ, Mode::OneShot),
                 move |_, _, state| {
+                    let mut redraw = false;
                     for cast in &mut state.niri.casting.casts {
                         if cast.stream_id == stream_id {
                             cast.inner.borrow_mut().fence_sources.remove(&pw_buffer);
@@ -53,7 +54,12 @@ impl Cast {
                             if result.is_none() {
                                 cast.stop_after_sync_failure();
                             }
+                            let mut inner = cast.inner.borrow_mut();
+                            redraw = inner.is_active && mem::take(&mut inner.waiting_for_buffer);
                         }
+                    }
+                    if redraw {
+                        state.redraw_cast(stream_id);
                     }
                     Ok(PostAction::Remove)
                 },
