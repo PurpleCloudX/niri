@@ -473,7 +473,11 @@ impl PipeWire {
             node_id: None,
             state: CastState::ResizePending { pending_size },
             refresh,
-            min_time_between_frames: Duration::ZERO,
+            min_time_between_frames: negotiated_frame_interval(Fraction {
+                num: refresh,
+                denom: 1000,
+            })
+            .unwrap_or(Duration::ZERO),
             dmabufs: HashMap::new(),
             shmbufs: HashMap::new(),
             rendering_buffers: Vec::new(),
@@ -560,7 +564,16 @@ impl PipeWire {
                     }
 
                     let mut format = VideoInfoRaw::new();
-                    format.parse(pod).unwrap();
+                    if let Err(err) = format.parse(pod) {
+                        warn!("error parsing raw video format: {err:?}");
+                        stop_cast();
+                        return;
+                    }
+                    if !matches!(format.format(), VideoFormat::BGRA | VideoFormat::BGRx) {
+                        warn!("consumer selected an unsupported video format");
+                        stop_cast();
+                        return;
+                    }
                     debug!("got format = {format:?}");
 
                     let format_size = Size::from((format.size().width, format.size().height));
@@ -585,10 +598,11 @@ impl PipeWire {
                     };
 
                     let max_frame_rate = format.max_framerate();
-                    let min_frame_time = Duration::from_micros(
-                        1_000_000 * u64::from(max_frame_rate.denom) / u64::from(max_frame_rate.num),
-                    );
-                    inner.min_time_between_frames = min_frame_time;
+                    // A missing/variable maximum rate is represented by a zero numerator.
+                    // Retain the existing output limit rather than dividing by zero.
+                    if let Some(interval) = negotiated_frame_interval(max_frame_rate) {
+                        inner.min_time_between_frames = interval;
+                    }
 
                     // We have following cases when param_changed:
                     //
@@ -1609,6 +1623,15 @@ fn make_pod(buffer: &mut Vec<u8>, object: pod::Object) -> &Pod {
     Pod::from_bytes(buffer).unwrap()
 }
 
+fn negotiated_frame_interval(rate: Fraction) -> Option<Duration> {
+    if rate.num == 0 || rate.denom == 0 {
+        return None;
+    }
+    Some(Duration::from_micros(
+        1_000_000 * u64::from(rate.denom) / u64::from(rate.num),
+    ))
+}
+
 fn request_shm_fallback(
     stream: &Stream,
     state: &mut CastState,
@@ -2031,6 +2054,29 @@ fn clear_shmbuf(shmbuf: &Shmbuf) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unspecified_frame_rates_preserve_the_existing_limit() {
+        assert_eq!(
+            negotiated_frame_interval(Fraction { num: 0, denom: 1 }),
+            None
+        );
+        assert_eq!(
+            negotiated_frame_interval(Fraction { num: 60, denom: 0 }),
+            None
+        );
+        assert_eq!(
+            negotiated_frame_interval(Fraction { num: 60, denom: 1 }),
+            Some(Duration::from_micros(16_666))
+        );
+        assert_eq!(
+            negotiated_frame_interval(Fraction {
+                num: 60_000,
+                denom: 1001
+            }),
+            Some(Duration::from_micros(16_683))
+        );
+    }
 
     #[test]
     fn shm_only_offer_excludes_modifiers_and_preserves_alpha_alternatives() {
