@@ -6,8 +6,7 @@ use pipewire::spa::sys::{spa_chunk, SPA_CHUNK_FLAG_NONE};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::egl::fence::EGLFence;
 use smithay::backend::renderer::element::RenderElement;
-use smithay::backend::renderer::gles::{GlesMapping, GlesRenderer, GlesTexture};
-use smithay::backend::renderer::ExportMem;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::reexports::rustix;
 use smithay::utils::{Physical, Scale, Size, Transform};
@@ -84,7 +83,7 @@ pub(super) fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbu
 
 #[derive(Debug)]
 pub(super) struct ShmReadback {
-    mapping: GlesMapping,
+    mapping: crate::render_helpers::pbo::Readback,
     buffer: Shmbuf,
     context: ContextId<GlesTexture>,
 }
@@ -95,16 +94,15 @@ impl ShmReadback {
             self.context == renderer.context_id(),
             "SHM readback renderer changed"
         );
-        let bytes = renderer
-            .map_texture(&self.mapping)
-            .context("error mapping texture")?;
-        ensure!(
-            bytes.len() >= self.buffer.layout.size_usize(),
-            "SHM readback is shorter than the frame"
-        );
-        self.buffer
-            .mapping
-            .copy_frame(&bytes[..self.buffer.layout.size_usize()])?;
+        self.mapping.with_bytes(renderer, |bytes| {
+            ensure!(
+                bytes.len() >= self.buffer.layout.size_usize(),
+                "SHM readback is shorter than the frame"
+            );
+            self.buffer
+                .mapping
+                .copy_frame(&bytes[..self.buffer.layout.size_usize()])
+        })?;
         Ok(self.buffer)
     }
 }
@@ -121,7 +119,7 @@ pub(super) fn render_to_shmbuf(
 ) -> anyhow::Result<(ShmReadback, Option<rustix::fd::OwnedFd>)> {
     ensure!(buffer.layout.matches(size), "invalid SHM buffer layout");
     let mapping =
-        staging.render_and_download(renderer, size, scale, transform, fourcc, elements)?;
+        staging.render_and_readback(renderer, size, scale, transform, fourcc, elements)?;
     // Fence creation follows ReadPixels in the same GL command stream.
     let fence = EGLFence::create(renderer.egl_context().display()).ok();
     renderer.with_context(|gl| unsafe { gl.Flush() })?;
@@ -166,25 +164,32 @@ mod tests {
             GlesRenderer::new(EGLContext::new(&display).unwrap()).unwrap()
         };
         let mut staging = StagingTexture::default();
-        for (color, expected) in [
-            ([1.0, 0.0, 0.0, 1.0], [0, 0, 255, 255]),
-            ([0.0, 1.0, 0.0, 1.0], [0, 255, 0, 255]),
+        let native = EGLFence::supports_importing(renderer.egl_context().display());
+        eprintln!("SHM test native fence support: {native}");
+        for (dimensions, color, expected) in [
+            ((16, 8), [1.0, 0.0, 0.0, 1.0], [0, 0, 255, 255]),
+            ((7, 13), [0.0, 1.0, 0.0, 1.0], [0, 255, 0, 255]),
         ] {
-            let buffer = allocate_shmbuf(Size::from((16, 8))).unwrap();
-            let solid = SolidColorBuffer::new((16.0, 8.0), color);
+            let buffer = allocate_shmbuf(Size::from(dimensions)).unwrap();
+            let solid = SolidColorBuffer::new((dimensions.0 as f64, dimensions.1 as f64), color);
             let element =
                 SolidColorRenderElement::from_buffer(&solid, (0.0, 0.0), 1.0, Kind::Unspecified);
             let (pending, fd) = render_to_shmbuf(
                 &mut renderer,
                 &mut staging,
                 &buffer,
-                Size::from((16, 8)),
+                Size::from((dimensions.0 as i32, dimensions.1 as i32)),
                 Scale::from(1.0),
                 Transform::Normal,
                 Fourcc::Argb8888,
                 &[element],
             )
             .unwrap();
+            assert_eq!(
+                fd.is_some(),
+                native,
+                "native fence silently fell back to synchronous readback"
+            );
             drop(buffer);
             if let Some(fd) = fd {
                 let mut event_loop = calloop::EventLoop::<bool>::try_new().unwrap();
@@ -212,8 +217,52 @@ mod tests {
             let mut file = std::fs::File::from(complete.fd.try_clone().unwrap());
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).unwrap();
-            assert_eq!(bytes.len(), 16 * 8 * 4);
+            assert_eq!(bytes.len(), (dimensions.0 * dimensions.1 * 4) as usize);
             assert!(bytes.chunks_exact(4).all(|pixel| pixel == expected));
+        }
+    }
+
+    #[test]
+    fn egl_cancelled_readback_releases_destination_and_rejects_other_context() {
+        use crate::render_helpers::solid_color::SolidColorRenderElement;
+        use smithay::backend::egl::{native::EGLSurfacelessDisplay, EGLContext, EGLDisplay};
+
+        let make_renderer = || unsafe {
+            let display = EGLDisplay::new(EGLSurfacelessDisplay).unwrap();
+            GlesRenderer::new(EGLContext::new(&display).unwrap()).unwrap()
+        };
+        let mut renderer = make_renderer();
+        let mut staging = StagingTexture::default();
+        for cancel in [true, false] {
+            let buffer = allocate_shmbuf(Size::from((4, 4))).unwrap();
+            let retained_fd = Rc::downgrade(&buffer.fd);
+            let retained_mapping = Rc::downgrade(&buffer.mapping);
+            let (pending, fd) = render_to_shmbuf(
+                &mut renderer,
+                &mut staging,
+                &buffer,
+                Size::from((4, 4)),
+                Scale::from(1.0),
+                Transform::Normal,
+                Fourcc::Argb8888,
+                &[] as &[SolidColorRenderElement],
+            )
+            .unwrap();
+            drop(buffer);
+            assert!(retained_fd.upgrade().is_some());
+            if cancel {
+                drop(pending);
+            } else {
+                let mut other = make_renderer();
+                assert!(pending
+                    .complete(&mut other)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("renderer changed"));
+            }
+            drop(fd);
+            assert!(retained_fd.upgrade().is_none());
+            assert!(retained_mapping.upgrade().is_none());
         }
     }
 
