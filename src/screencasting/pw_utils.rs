@@ -9,8 +9,8 @@ use std::rc::Rc;
 use std::time::Duration;
 use std::{mem, ptr, slice};
 
-use anyhow::Context as _;
 use anyhow::ensure;
+use anyhow::Context as _;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::RegistrationToken;
 use pipewire::context::ContextRc;
@@ -35,7 +35,7 @@ use pipewire::sys::{pw_buffer, pw_check_library_version, pw_stream_queue_buffer}
 use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmBuffer, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::{Fourcc};
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
@@ -63,7 +63,6 @@ use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
 const SHM_BLOCKS: usize = 1;
 const SHM_BYTES_PER_PIXEL: usize = 4;
-
 
 const CURSOR_FORMAT: spa_video_format = SPA_VIDEO_FORMAT_BGRA;
 const CURSOR_BPP: u32 = 4;
@@ -240,11 +239,11 @@ fn make_video_params(
             key: FormatProperties::VideoModifier.as_raw(),
             flags,
             value: pod::Value::Choice(ChoiceValue::Long(Choice(
-                        ChoiceFlags::empty(),
-                        ChoiceEnum::Enum {
-                            default: modifiers_i64[0],
-                            alternatives: modifiers_i64,
-                        },
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default: modifiers_i64[0],
+                    alternatives: modifiers_i64,
+                },
             ))),
         })
     };
@@ -261,42 +260,42 @@ fn make_video_params(
                 .iter()
                 .map(|video_format| pod::property!(FormatProperties::VideoFormat, Id, video_format))
                 .collect(),
-                match modifier_property {
-                    Some(prop) => vec![prop],
-                    None => vec![],
-                },
-                vec![
-                    pod::property!(
-                        FormatProperties::VideoSize,
-                        Rectangle,
-                        Rectangle {
-                            width: size.w,
-                            height: size.h,
-        }
-                    ),
-                    pod::property!(
-                        FormatProperties::VideoFramerate,
-                        Fraction,
-                        Fraction { num: 0, denom: 1 }
-                    ),
-                    pod::property!(
-                        FormatProperties::VideoMaxFramerate,
-                        Choice,
-                        Range,
-                        Fraction,
-                        Fraction {
-                            num: refresh,
-                            denom: 1000
-                        },
-                        Fraction { num: 1, denom: 1 },
-                        Fraction {
-                            num: refresh,
-                            denom: 1000
-        }
-                    ),
-                    ],
-                    ]
-                        .concat(),
+            match modifier_property {
+                Some(prop) => vec![prop],
+                None => vec![],
+            },
+            vec![
+                pod::property!(
+                    FormatProperties::VideoSize,
+                    Rectangle,
+                    Rectangle {
+                        width: size.w,
+                        height: size.h,
+                    }
+                ),
+                pod::property!(
+                    FormatProperties::VideoFramerate,
+                    Fraction,
+                    Fraction { num: 0, denom: 1 }
+                ),
+                pod::property!(
+                    FormatProperties::VideoMaxFramerate,
+                    Choice,
+                    Range,
+                    Fraction,
+                    Fraction {
+                        num: refresh,
+                        denom: 1000
+                    },
+                    Fraction { num: 1, denom: 1 },
+                    Fraction {
+                        num: refresh,
+                        denom: 1000
+                    }
+                ),
+            ],
+        ]
+        .concat(),
     }
 }
 
@@ -332,13 +331,20 @@ fn make_video_params_for_initial_negotiation_with_extra_buffer(
         trace!("offering: {modifiers:?}");
 
         if modifiers.len() == 0 {
-            vec![
-                (make_video_params(&video_formats, &vec![], size, refresh, false), Vec::new()),
-            ]
+            vec![(
+                make_video_params(&video_formats, &vec![], size, refresh, false),
+                Vec::new(),
+            )]
         } else {
             vec![
-                (make_video_params(&video_formats, &modifiers, size, refresh, false), Vec::new()),
-                (make_video_params(&video_formats, &vec![], size, refresh, false), Vec::new()),
+                (
+                    make_video_params(&video_formats, &modifiers, size, refresh, false),
+                    Vec::new(),
+                ),
+                (
+                    make_video_params(&video_formats, &vec![], size, refresh, false),
+                    Vec::new(),
+                ),
             ]
         }
     };
@@ -352,14 +358,15 @@ fn make_video_params_for_initial_negotiation_with_extra_buffer(
 
 macro_rules! make_video_params_for_initial_negotiation_macro {
     ($params:ident, $formats:expr, $size:expr, $refresh:expr, $alpha:expr) => {
-        let mut $params = make_video_params_for_initial_negotiation_with_extra_buffer($formats, $size, $refresh, $alpha);
+        let mut $params = make_video_params_for_initial_negotiation_with_extra_buffer(
+            $formats, $size, $refresh, $alpha,
+        );
         let $params: Vec<_> = $params
             .iter_mut()
             .map(|(obj, buf)| make_pod(buf, (*obj).clone()))
             .collect();
     };
 }
-
 
 impl PipeWire {
     pub fn new(
@@ -1016,7 +1023,13 @@ impl PipeWire {
             "starting pw stream with size={pending_size:?}, refresh={refresh:?}"
         );
 
-        make_video_params_for_initial_negotiation_macro!(params, &formats, pending_size, refresh, alpha);
+        make_video_params_for_initial_negotiation_macro!(
+            params,
+            &formats,
+            pending_size,
+            refresh,
+            alpha
+        );
         stream
             .connect(
                 Direction::Output,
@@ -1077,7 +1090,13 @@ impl Cast {
             pending_size: new_size,
         };
 
-        make_video_params_for_initial_negotiation_macro!(params, &self.formats, new_size, inner.refresh, self.offer_alpha);
+        make_video_params_for_initial_negotiation_macro!(
+            params,
+            &self.formats,
+            new_size,
+            inner.refresh,
+            self.offer_alpha
+        );
         self.stream
             .update_params(params.clone().as_mut_slice())
             .context("error updating stream params")?;
@@ -1097,7 +1116,13 @@ impl Cast {
         inner.refresh = refresh;
 
         let size = inner.state.expected_format_size();
-        make_video_params_for_initial_negotiation_macro!(params, &self.formats, size, refresh, self.offer_alpha);
+        make_video_params_for_initial_negotiation_macro!(
+            params,
+            &self.formats,
+            size,
+            refresh,
+            self.offer_alpha
+        );
         self.stream
             .update_params(params.clone().as_mut_slice())
             .context("error updating stream params")?;
@@ -1288,7 +1313,8 @@ impl Cast {
             cursor_damage_tracker,
             last_cursor_location,
             ..
-        } = &mut inner.state {
+        } = &mut inner.state
+        {
             let damage_tracker = damage_tracker
                 .get_or_insert_with(|| OutputDamageTracker::new(size, scale, Transform::Normal));
             let cursor_damage_tracker = cursor_damage_tracker.get_or_insert_with(|| {
@@ -1346,7 +1372,13 @@ impl Cast {
 
             let mut inner = self.inner.borrow_mut();
             let inner_ = &mut *inner;
-            let CastState::Ready { damage_tracker, extra_negotiation_result, alpha, .. } = &mut inner_.state else {
+            let CastState::Ready {
+                damage_tracker,
+                extra_negotiation_result,
+                alpha,
+                ..
+            } = &mut inner_.state
+            else {
                 unreachable!()
             };
             let damage_tracker = damage_tracker.as_mut().unwrap();
@@ -1368,12 +1400,17 @@ impl Cast {
                 match extra_negotiation_result {
                     Some(_) => {
                         let dmabuf = inner_.dmabufs[&fd].clone();
-                        let res = render_to_dmabuf(renderer, damage_tracker, dmabuf, elements, states);
+                        let res =
+                            render_to_dmabuf(renderer, damage_tracker, dmabuf, elements, states);
                         drop(inner);
 
                         match res {
                             Ok(sync_point) => {
-                                mark_buffer_after_render(pw_buffer, &mut self.sequence_counter, SharingBuf::DMA(()));
+                                mark_buffer_after_render(
+                                    pw_buffer,
+                                    &mut self.sequence_counter,
+                                    SharingBuf::DMA(()),
+                                );
                                 trace!("queueing buffer with seq={}", self.sequence_counter);
                                 self.queue_after_sync(pw_buffer, sync_point);
                                 true
@@ -1389,7 +1426,11 @@ impl Cast {
                         let shmbuf = inner_.shmbufs[&fd].clone();
                         drop(inner);
 
-                        let fourcc = if alpha { Fourcc::Argb8888 } else { Fourcc::Xrgb8888 };
+                        let fourcc = if alpha {
+                            Fourcc::Argb8888
+                        } else {
+                            Fourcc::Xrgb8888
+                        };
 
                         match render_to_shmbuf(
                             renderer,
@@ -1401,7 +1442,11 @@ impl Cast {
                             elements.iter().rev(),
                         ) {
                             Ok(()) => {
-                                mark_buffer_after_render(pw_buffer, &mut self.sequence_counter, SharingBuf::SHM(&shmbuf));
+                                mark_buffer_after_render(
+                                    pw_buffer,
+                                    &mut self.sequence_counter,
+                                    SharingBuf::SHM(&shmbuf),
+                                );
                                 trace!("queueing buffer with seq={}", self.sequence_counter);
                                 self.queue_after_sync(pw_buffer, SyncPoint::signaled());
                                 true
@@ -1415,8 +1460,7 @@ impl Cast {
                     }
                 }
             }
-        }
-        else {
+        } else {
             error!("cast must be in Ready state to render");
             false
         }
@@ -1456,7 +1500,11 @@ impl Cast {
 
                 match clear_dmabuf(renderer, dmabuf) {
                     Ok(sync_point) => {
-                        mark_buffer_after_render(pw_buffer, &mut self.sequence_counter, SharingBuf::DMA(()));
+                        mark_buffer_after_render(
+                            pw_buffer,
+                            &mut self.sequence_counter,
+                            SharingBuf::DMA(()),
+                        );
                         trace!("queueing clear buffer with seq={}", self.sequence_counter);
                         self.queue_after_sync(pw_buffer, sync_point);
                         true
@@ -1485,8 +1533,12 @@ impl Cast {
                 let shmbuf = self.inner.borrow().shmbufs[&fd].clone();
 
                 match clear_shmbuf(&shmbuf) {
-                    Ok (()) => {
-                        mark_buffer_after_render(pw_buffer, &mut self.sequence_counter, SharingBuf::SHM(&shmbuf));
+                    Ok(()) => {
+                        mark_buffer_after_render(
+                            pw_buffer,
+                            &mut self.sequence_counter,
+                            SharingBuf::SHM(&shmbuf),
+                        );
                         trace!("queueing clear buffer with seq={}", self.sequence_counter);
                         self.queue_after_sync(pw_buffer, SyncPoint::signaled());
                         true
@@ -1501,7 +1553,6 @@ impl Cast {
                 warn!("unknown data type in dequeue_buffer_and_clear");
                 false
             }
-
         }
     }
 }
@@ -1631,36 +1682,39 @@ impl ShmLayout {
     fn size_usize(self) -> usize {
         self.size as usize
     }
+
+    fn matches(self, size: Size<i32, Physical>, stride: i32, buffer_size: usize) -> bool {
+        size.w >= 0
+            && size.h >= 0
+            && self.stride == stride
+            && self.size_usize() == buffer_size
+            && self.stride == size.w.saturating_mul(SHM_BYTES_PER_PIXEL as i32)
+    }
 }
 
 enum SharingBuf<'a> {
-    DMA (()),
-    SHM (&'a Shmbuf),
+    DMA(()),
+    SHM(&'a Shmbuf),
 }
 
 fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbuf> {
     let layout = ShmLayout::new(size)?;
     let fd = rustix::fs::memfd_create(
         "shm_buffer",
-        rustix::fs::MemfdFlags::CLOEXEC
-        | rustix::fs::MemfdFlags::ALLOW_SEALING,
+        rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
     )
-        .context("error creating memfd")?;
-    let _ = rustix::fs::ftruncate(&fd, layout.size.into())
-        .context("error set size of the fd")?;
+    .context("error creating memfd")?;
+    let _ = rustix::fs::ftruncate(&fd, layout.size.into()).context("error set size of the fd")?;
     let _ = rustix::fs::fcntl_add_seals(
         &fd,
-        rustix::fs::SealFlags::SEAL
-        | rustix::fs::SealFlags::SHRINK
-        | rustix::fs::SealFlags::GROW,
+        rustix::fs::SealFlags::SEAL | rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW,
     )
-        .context("error sealing the fd")?;
+    .context("error sealing the fd")?;
     Ok(Shmbuf {
         fd: fd.into(),
         layout,
     })
 }
-
 
 unsafe fn return_unused_buffer(stream: &Stream, pw_buffer: NonNull<pw_buffer>) {
     // pw_stream_return_buffer() requires too new PipeWire (1.4.0). So, mark as
@@ -1680,7 +1734,11 @@ unsafe fn return_unused_buffer(stream: &Stream, pw_buffer: NonNull<pw_buffer>) {
     pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer);
 }
 
-unsafe fn mark_buffer_after_render(pw_buffer: NonNull<pw_buffer>, sequence: &mut u64, buf: SharingBuf) {
+unsafe fn mark_buffer_after_render(
+    pw_buffer: NonNull<pw_buffer>,
+    sequence: &mut u64,
+    buf: SharingBuf,
+) {
     let pw_buffer = pw_buffer.as_ptr();
     let spa_buffer = (*pw_buffer).buffer;
     let chunk = (*(*spa_buffer).datas).chunk;
@@ -1702,7 +1760,6 @@ unsafe fn mark_buffer_after_render(pw_buffer: NonNull<pw_buffer>, sequence: &mut
             mark_shm_chunk_rendered(&mut *chunk, shmbuf.layout);
         }
     }
-
 
     *sequence = sequence.wrapping_add(1);
     if let Some(header) = find_meta_header(spa_buffer) {
@@ -1734,8 +1791,14 @@ fn render_to_shmbuf(
     fourcc: Fourcc,
     elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
 ) -> anyhow::Result<()> {
-    let expected_size = size.w as usize * size.h as usize * SHM_BYTES_PER_PIXEL as usize;
-    ensure!(buffer.layout.size_usize() == expected_size, "invalid buffer size");
+    ensure!(
+        buffer.layout.matches(
+            size,
+            size.w.saturating_mul(SHM_BYTES_PER_PIXEL as i32),
+            size.w.max(0) as usize * size.h.max(0) as usize * SHM_BYTES_PER_PIXEL,
+        ),
+        "invalid SHM buffer layout"
+    );
     let mapping = render_and_download(renderer, size, scale, transform, fourcc, elements)?;
     let bytes = renderer
         .map_texture(&mapping)
