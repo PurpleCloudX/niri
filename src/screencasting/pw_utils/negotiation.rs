@@ -36,7 +36,6 @@ pub(super) fn listener(
     gbm: GbmDevice<DrmDeviceFd>,
     formats: FormatSet,
     stream_id: CastStreamId,
-    refresh: u32,
     cursor_mode: CursorMode,
 ) -> impl Fn(&Stream, &mut (), u32, Option<&Pod>) {
     move |stream, (), id, pod| {
@@ -44,6 +43,7 @@ pub(super) fn listener(
         trace!(%stream_id, ?id, "param_changed");
         let mut inner = inner.borrow_mut();
         let inner = &mut *inner;
+        let refresh = inner.refresh;
 
         if id != ParamType::Format {
             return;

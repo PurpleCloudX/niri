@@ -376,7 +376,7 @@ impl PipeWire {
             })
             .param_changed(negotiation::listener(
                 inner.clone(), stop_cast.clone(), gbm.clone(), formats.clone(),
-                stream_id, refresh, cursor_mode,
+                stream_id, cursor_mode,
             ))
             .add_buffer({
                 let inner = inner.clone();
