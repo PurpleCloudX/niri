@@ -978,6 +978,10 @@ impl PipeWire {
                                         let fd = (*(*spa_buffer).datas).fd;
                                         assert!(inner.shmbufs.insert(fd, shmbuf).is_none());
                                     }
+                                    // A resize may leave the stream running without a state change.
+                                    if inner.shmbufs.len() == 1 && stream.state() == StreamState::Streaming {
+                                        redraw_();
+                                    }
                                 }
                             }
                         },
