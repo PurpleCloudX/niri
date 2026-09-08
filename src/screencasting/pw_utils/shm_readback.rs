@@ -21,8 +21,9 @@ impl Cast {
                 warn!("error completing SHM readback: {err:#}");
                 self.inner.borrow_mut().state.invalidate_damage();
                 unsafe {
-                    return_unused_buffer(&self.stream, buffer);
+                    self.return_unused_buffer(buffer);
                 }
+                self.stop_after_sync_failure();
                 false
             }
         }
@@ -49,9 +50,9 @@ impl Cast {
                         if cast.stream_id == stream_id {
                             cast.inner.borrow_mut().fence_sources.remove(&pw_buffer);
                             let result = state.backend.with_primary_renderer(|renderer| {
-                                cast.complete_shm_readback(pw_buffer, renderer);
+                                cast.complete_shm_readback(pw_buffer, renderer)
                             });
-                            if result.is_none() {
+                            if result != Some(true) {
                                 cast.stop_after_sync_failure();
                             }
                             let mut inner = cast.inner.borrow_mut();
