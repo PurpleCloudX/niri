@@ -162,9 +162,9 @@ fn egl_partial_updates_match_full_frames_across_buffer_rotation() {
             &mut staging,
             buffer,
             crate::render_helpers::ReadbackFrame {
-                size: size,
-                scale: scale,
-                transform: transform,
+                size,
+                scale,
+                transform,
                 fourcc: Fourcc::Argb8888,
                 elements: &elements,
             },

@@ -367,7 +367,7 @@ fn egl_staging_preserves_unchanged_pixels_and_invalidates_geometry() {
                 scale,
                 transform,
                 Fourcc::Argb8888,
-                &[back.clone()],
+                std::slice::from_ref(&back),
             )
             .unwrap();
         let pixels = renderer.map_texture(&mapping).unwrap().to_vec();
