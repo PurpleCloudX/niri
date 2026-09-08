@@ -1743,10 +1743,12 @@ unsafe fn return_unused_buffer(stream: &Stream, pw_buffer: NonNull<pw_buffer>) {
     // corrupted and queue.
     let pw_buffer = pw_buffer.as_ptr();
     let spa_buffer = (*pw_buffer).buffer;
-    let chunk = (*(*spa_buffer).datas).chunk;
     // Some (older?) consumers will check for size == 0 instead of the CORRUPTED flag.
-    (*chunk).size = 0;
-    (*chunk).flags = SPA_CHUNK_FLAG_CORRUPTED as i32;
+    for i in 0..(*spa_buffer).n_datas as usize {
+        let chunk = (*(*spa_buffer).datas.add(i)).chunk;
+        (*chunk).size = 0;
+        (*chunk).flags = SPA_CHUNK_FLAG_CORRUPTED as i32;
+    }
 
     if let Some(header) = find_meta_header(spa_buffer) {
         let header = header.as_ptr();
@@ -1774,9 +1776,12 @@ unsafe fn mark_buffer_after_render(
             //
             // However, OBS checks for size != 0 as a workaround for old compositor versions,
             // so we set it to 1.
-            (*chunk).size = 1;
-            // Clear the corrupted flag that return_unused_buffer() may have set.
-            (*chunk).flags = SPA_CHUNK_FLAG_NONE as i32;
+            for i in 0..(*spa_buffer).n_datas as usize {
+                let chunk = (*(*spa_buffer).datas.add(i)).chunk;
+                (*chunk).size = 1;
+                // Preserve each plane's stride and offset from allocation.
+                (*chunk).flags = SPA_CHUNK_FLAG_NONE as i32;
+            }
         }
         SharingBuf::SHM(shmbuf) => {
             mark_shm_chunk_rendered(&mut *chunk, shmbuf.layout);
@@ -1982,6 +1987,48 @@ fn clear_shmbuf(shmbuf: &Shmbuf) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_dma_buffer_restores_every_plane_without_changing_layout() {
+        let mut chunks = [
+            spa_chunk {
+                offset: 128,
+                size: 0,
+                stride: 1024,
+                flags: SPA_CHUNK_FLAG_CORRUPTED as i32,
+            },
+            spa_chunk {
+                offset: 4096,
+                size: 0,
+                stride: 256,
+                flags: SPA_CHUNK_FLAG_CORRUPTED as i32,
+            },
+        ];
+        let mut data: [spa_data; 2] = unsafe { mem::zeroed() };
+        for (data, chunk) in data.iter_mut().zip(chunks.iter_mut()) {
+            data.chunk = chunk;
+        }
+        let mut spa: spa_buffer = unsafe { mem::zeroed() };
+        spa.n_datas = 2;
+        spa.datas = data.as_mut_ptr();
+        let mut buffer: pw_buffer = unsafe { mem::zeroed() };
+        buffer.buffer = &mut spa;
+        let mut sequence = 7;
+        unsafe {
+            mark_buffer_after_render(
+                NonNull::from(&mut buffer),
+                &mut sequence,
+                SharingBuf::DMA(()),
+            )
+        };
+        assert_eq!(sequence, 8);
+        for chunk in &chunks {
+            assert_eq!(chunk.size, 1);
+            assert_eq!(chunk.flags, SPA_CHUNK_FLAG_NONE as i32);
+        }
+        assert_eq!((chunks[0].stride, chunks[0].offset), (1024, 128));
+        assert_eq!((chunks[1].stride, chunks[1].offset), (256, 4096));
+    }
 
     #[test]
     fn shm_mapping_survives_buffer_clone_and_reuses_storage() {
