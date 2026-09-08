@@ -63,6 +63,7 @@ use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
 const SHM_BLOCKS: usize = 1;
 const SHM_BYTES_PER_PIXEL: usize = 4;
+mod dmabuf_layout;
 mod shm_mapping;
 use shm_mapping::ShmMapping;
 
@@ -951,11 +952,16 @@ impl PipeWire {
 
                                             (*spa_data).type_ = DataType::DmaBuf.as_raw();
 
-                                            // With DMA-BUFs, consumers should ignore the maxsize field, and
-                                            // producers are allowed to set it to 0.
-                                            //
-                                            // https://docs.pipewire.org/page_dma_buf.html
-                                            (*spa_data).maxsize = 1;
+                                            // GStreamer also uses this extent to locate linear video
+                                            // planes. Publish the allocation size, not a one-byte sentinel.
+                                            (*spa_data).maxsize = match dmabuf_layout::backing_size(fd, offset) {
+                                                Ok(size) => size,
+                                                Err(err) => {
+                                                    warn!("invalid DMA-BUF plane layout: {err:?}");
+                                                    stop_cast();
+                                                    return;
+                                                }
+                                            };
                                             (*spa_data).fd = fd.as_raw_fd() as i64;
                                             (*spa_data).flags = SPA_DATA_FLAG_READWRITE;
 
@@ -1836,16 +1842,11 @@ unsafe fn mark_buffer_after_render(
 
     match buf {
         SharingBuf::DMA(_) => {
-            // With DMA-BUFs, consumers should ignore the size field, and producers are allowed
-            // to set it to 0.
-            //
-            // https://docs.pipewire.org/page_dma_buf.html
-            //
-            // However, OBS checks for size != 0 as a workaround for old compositor versions,
-            // so we set it to 1.
+            // Restore the readable extent after returning an unused/corrupted buffer.
+            // GStreamer needs the full extent even though PipeWire permits a sentinel.
             for i in 0..(*spa_buffer).n_datas as usize {
                 let chunk = (*(*spa_buffer).datas.add(i)).chunk;
-                (*chunk).size = 1;
+                (*chunk).size = (*(*spa_buffer).datas.add(i)).maxsize - (*chunk).offset;
                 // Preserve each plane's stride and offset from allocation.
                 (*chunk).flags = SPA_CHUNK_FLAG_NONE as i32;
             }
@@ -2128,6 +2129,7 @@ mod tests {
         let mut data: [spa_data; 2] = unsafe { mem::zeroed() };
         for (data, chunk) in data.iter_mut().zip(chunks.iter_mut()) {
             data.chunk = chunk;
+            data.maxsize = 8192;
         }
         let mut spa: spa_buffer = unsafe { mem::zeroed() };
         spa.n_datas = 2;
@@ -2144,7 +2146,7 @@ mod tests {
         };
         assert_eq!(sequence, 8);
         for chunk in &chunks {
-            assert_eq!(chunk.size, 1);
+            assert_eq!(chunk.size, 8192 - chunk.offset);
             assert_eq!(chunk.flags, SPA_CHUNK_FLAG_NONE as i32);
         }
         assert_eq!((chunks[0].stride, chunks[0].offset), (1024, 128));
