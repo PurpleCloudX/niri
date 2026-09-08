@@ -3,9 +3,51 @@ use super::formats::{make_pod, make_video_params_for_initial_negotiation_with_ex
 use super::*;
 
 #[test]
+fn reused_buffer_publishes_current_monotonic_timestamp() {
+    let mut header: spa_meta_header = unsafe { mem::zeroed() };
+    header.pts = -1;
+    header.dts_offset = 123;
+    let mut meta = pipewire::spa::sys::spa_meta {
+        type_: SPA_META_Header,
+        size: size_of::<spa_meta_header>() as u32,
+        data: (&mut header as *mut spa_meta_header).cast(),
+    };
+    let mut chunk: spa_chunk = unsafe { mem::zeroed() };
+    let mut data: spa_data = unsafe { mem::zeroed() };
+    data.chunk = &mut chunk;
+    data.maxsize = 4;
+    let mut spa: spa_buffer = unsafe { mem::zeroed() };
+    spa.n_datas = 1;
+    spa.datas = &mut data;
+    spa.n_metas = 1;
+    spa.metas = &mut meta;
+    let mut buffer: pw_buffer = unsafe { mem::zeroed() };
+    buffer.buffer = &mut spa;
+    let before = get_monotonic_time().as_nanos();
+    let mut sequence = 0;
+    for _ in 0..2 {
+        header.pts = -1;
+        unsafe {
+            mark_buffer_after_render(
+                NonNull::from(&mut buffer),
+                &mut sequence,
+                SharingBuf::DMA(()),
+            );
+        }
+        assert!(header.pts as u128 >= before);
+        assert!(header.pts as u128 <= get_monotonic_time().as_nanos());
+        assert_eq!(header.dts_offset, 0);
+        assert_eq!(header.seq, sequence);
+    }
+}
+
+#[test]
 fn rejected_buffer_clears_all_planes_and_can_be_rendered_again() {
     let mut chunks = [spa_chunk {
-        offset: 16, size: 48, stride: 8, flags: 0,
+        offset: 16,
+        size: 48,
+        stride: 8,
+        flags: 0,
     }; 2];
     let mut data: [spa_data; 2] = unsafe { mem::zeroed() };
     for (plane, chunk) in data.iter_mut().zip(&mut chunks) {
@@ -17,14 +59,22 @@ fn rejected_buffer_clears_all_planes_and_can_be_rendered_again() {
     spa.datas = data.as_mut_ptr();
     let mut buffer: pw_buffer = unsafe { mem::zeroed() };
     buffer.buffer = &mut spa;
-    unsafe { mark_buffer_corrupted(NonNull::from(&mut buffer)); }
+    unsafe {
+        mark_buffer_corrupted(NonNull::from(&mut buffer));
+    }
     for chunk in &chunks {
         assert_eq!(chunk.size, 0);
         assert_eq!(chunk.flags, SPA_CHUNK_FLAG_CORRUPTED as i32);
         assert_eq!((chunk.offset, chunk.stride), (16, 8));
     }
     let mut sequence = 0;
-    unsafe { mark_buffer_after_render(NonNull::from(&mut buffer), &mut sequence, SharingBuf::DMA(())); }
+    unsafe {
+        mark_buffer_after_render(
+            NonNull::from(&mut buffer),
+            &mut sequence,
+            SharingBuf::DMA(()),
+        );
+    }
     for chunk in &chunks {
         assert_eq!(chunk.size, 48);
         assert_eq!(chunk.flags, SPA_CHUNK_FLAG_NONE as i32);
@@ -40,13 +90,16 @@ fn removing_a_ready_fence_source_closes_fd_and_cancels_callback() {
     let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
     let (reader, mut writer) = UnixStream::pair().unwrap();
     writer.set_nonblocking(true).unwrap();
-    let token = event_loop.handle().insert_source(
-        Generic::new(reader, Interest::READ, Mode::OneShot),
-        |_, _, calls| {
-            *calls += 1;
-            Ok(PostAction::Remove)
-        },
-    ).unwrap();
+    let token = event_loop
+        .handle()
+        .insert_source(
+            Generic::new(reader, Interest::READ, Mode::OneShot),
+            |_, _, calls| {
+                *calls += 1;
+                Ok(PostAction::Remove)
+            },
+        )
+        .unwrap();
     writer.write_all(&[1]).unwrap();
     event_loop.handle().remove(token);
     let mut calls = 0;
@@ -54,7 +107,10 @@ fn removing_a_ready_fence_source_closes_fd_and_cancels_callback() {
     assert_eq!(calls, 0);
     // Closing a socket with unread data can yield reset rather than EOF.
     let result = writer.read(&mut [0]);
-    assert!(matches!(result, Ok(0)) || result.is_err_and(|err| err.kind() == std::io::ErrorKind::ConnectionReset));
+    assert!(
+        matches!(result, Ok(0))
+            || result.is_err_and(|err| err.kind() == std::io::ErrorKind::ConnectionReset)
+    );
 }
 
 #[test]
@@ -65,15 +121,25 @@ fn fence_completing_during_failed_export_is_deliverable() {
     #[derive(Debug, Default)]
     struct CompletingFence(AtomicBool);
     impl Fence for CompletingFence {
-        fn is_signaled(&self) -> bool { self.0.load(Ordering::SeqCst) }
-        fn wait(&self) -> Result<(), Interrupted> { panic!("must not block") }
-        fn is_exportable(&self) -> bool { true }
+        fn is_signaled(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+        fn wait(&self) -> Result<(), Interrupted> {
+            panic!("must not block")
+        }
+        fn is_exportable(&self) -> bool {
+            true
+        }
         fn export(&self) -> Option<std::os::fd::OwnedFd> {
             self.0.store(true, Ordering::SeqCst);
             None
         }
     }
-    assert!(export_pending_fence(&SyncPoint::from(CompletingFence::default())).unwrap().is_none());
+    assert!(
+        export_pending_fence(&SyncPoint::from(CompletingFence::default()))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -83,15 +149,29 @@ fn failed_fence_export_does_not_imply_gpu_completion() {
     #[derive(Debug)]
     struct UnexportableFence(bool);
     impl Fence for UnexportableFence {
-        fn is_signaled(&self) -> bool { self.0 }
-        fn wait(&self) -> Result<(), Interrupted> { panic!("must not block the compositor") }
-        fn is_exportable(&self) -> bool { false }
-        fn export(&self) -> Option<std::os::fd::OwnedFd> { None }
+        fn is_signaled(&self) -> bool {
+            self.0
+        }
+        fn wait(&self) -> Result<(), Interrupted> {
+            panic!("must not block the compositor")
+        }
+        fn is_exportable(&self) -> bool {
+            false
+        }
+        fn export(&self) -> Option<std::os::fd::OwnedFd> {
+            None
+        }
     }
 
     assert!(export_pending_fence(&SyncPoint::from(UnexportableFence(false))).is_err());
-    assert!(export_pending_fence(&SyncPoint::from(UnexportableFence(true))).unwrap().is_none());
-    assert!(export_pending_fence(&SyncPoint::signaled()).unwrap().is_none());
+    assert!(
+        export_pending_fence(&SyncPoint::from(UnexportableFence(true)))
+            .unwrap()
+            .is_none()
+    );
+    assert!(export_pending_fence(&SyncPoint::signaled())
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -101,7 +181,10 @@ fn invalidating_an_undelivered_frame_restores_static_scene_damage() {
 
     let buffer = SolidColorBuffer::new((16.0, 8.0), [1.0, 0.0, 0.0, 1.0]);
     let elements = [SolidColorRenderElement::from_buffer(
-        &buffer, (0.0, 0.0), 1.0, Kind::Unspecified,
+        &buffer,
+        (0.0, 0.0),
+        1.0,
+        Kind::Unspecified,
     )];
     let mut state = CastState::Ready {
         size: Size::from((16, 8)),
@@ -112,11 +195,15 @@ fn invalidating_an_undelivered_frame_restores_static_scene_damage() {
         last_cursor_location: None,
     };
     let damaged = |state: &mut CastState| {
-        let CastState::Ready { damage_tracker, .. } = state else { unreachable!() };
+        let CastState::Ready { damage_tracker, .. } = state else {
+            unreachable!()
+        };
         damage_tracker
             .get_or_insert_with(|| OutputDamageTracker::new((16, 8), 1.0, Transform::Normal))
             .damage_output(1, &elements)
-            .unwrap().0.is_some()
+            .unwrap()
+            .0
+            .is_some()
     };
     assert!(damaged(&mut state));
     assert!(!damaged(&mut state));

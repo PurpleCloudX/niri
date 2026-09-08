@@ -2,7 +2,10 @@ use super::*;
 
 impl Cast {
     fn queue_completed_buffers(&mut self) -> bool {
-        let mut inner = self.inner.borrow_mut();
+        let inner = self.inner.borrow();
+        if inner.stopping {
+            return false;
+        }
 
         // We want to queue buffers in order, so find the first still-rendering buffer, and queue
         // everything up to that. Even if there are completed buffers past the first
@@ -14,33 +17,38 @@ impl Cast {
             .position(|(_, sync)| !sync.is_reached())
             .unwrap_or(inner.rendering_buffers.len());
 
-        let CastInner {
-            rendering_buffers,
-            fence_sources,
-            ..
-        } = &mut *inner;
-        let mut failure = None;
-        for (buffer, _) in rendering_buffers.drain(..first_in_progress_idx) {
+        drop(inner);
+        for _ in 0..first_in_progress_idx {
+            let mut inner = self.inner.borrow_mut();
+            if inner.stopping {
+                return false;
+            }
+            // A PipeWire call may have retired a buffer or changed the pending queue.
+            if !inner
+                .rendering_buffers
+                .first()
+                .is_some_and(|(_, sync)| sync.is_reached())
+            {
+                break;
+            }
+            let (buffer, _) = inner.rendering_buffers.remove(0);
             // A previous fence can complete several frames before their own callbacks run.
-            if let Some(token) = fence_sources.remove(&buffer) {
+            if let Some(token) = inner.fence_sources.remove(&buffer) {
                 self.event_loop.remove(token);
             }
+            // Never retain a RefCell borrow across a foreign call which may invoke callbacks.
+            drop(inner);
             trace!("queueing completed buffer");
             unsafe {
                 if let Err(err) = check_queue_result(pw_stream_queue_buffer(
                     self.stream.as_raw_ptr(),
                     buffer.as_ptr(),
                 )) {
-                    failure = Some(err);
-                    break;
+                    warn!("cannot deliver capture buffer: {err:#}");
+                    self.stop_after_sync_failure();
+                    return false;
                 }
             }
-        }
-        drop(inner);
-        if let Some(err) = failure {
-            warn!("cannot deliver capture buffer: {err:#}");
-            self.stop_after_sync_failure();
-            return false;
         }
         true
     }
@@ -60,6 +68,9 @@ impl Cast {
         let _span = tracy_client::span!("Cast::queue_after_sync");
 
         let mut inner = self.inner.borrow_mut();
+        if inner.stopping {
+            return false;
+        }
 
         // Original upstream rationale, retained for reference:
         // There are two main ways this can happen. First is that the SyncPoint is

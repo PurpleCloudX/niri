@@ -50,16 +50,16 @@ use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 // Give a 0.1 ms allowance for presentation time errors.
 const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
 const SHM_BLOCKS: usize = 1;
-mod dmabuf_layout;
 mod delivery;
+mod dmabuf_layout;
 mod formats;
 use formats::make_video_params_for_initial_negotiation_macro;
 mod modifier_selection;
 mod negotiation;
+mod recovery;
 mod shm_buffer;
 mod shm_mapping;
 mod shm_readback;
-mod recovery;
 use shm_buffer::{
     allocate_shmbuf, clear_shmbuf, mark_shm_chunk_rendered, render_to_shmbuf, ShmLayout, Shmbuf,
 };
@@ -622,7 +622,8 @@ impl PipeWire {
 
 impl Cast {
     pub fn is_active(&self) -> bool {
-        self.inner.borrow().is_active
+        let inner = self.inner.borrow();
+        inner.is_active && !inner.stopping
     }
 
     pub fn node_id(&self) -> Option<u32> {
@@ -784,8 +785,6 @@ impl Cast {
         unsafe { NonNull::new(self.stream.dequeue_raw_buffer()) }
     }
 
-
-
     #[allow(clippy::too_many_arguments)]
     pub fn dequeue_buffer_and_render(
         &mut self,
@@ -799,6 +798,10 @@ impl Cast {
         if !inner.pending_shm.is_empty() {
             inner.state.invalidate_damage();
             inner.waiting_for_buffer = true;
+            return false;
+        }
+
+        if inner.stopping {
             return false;
         }
 
@@ -880,7 +883,7 @@ impl Cast {
                 unreachable!()
             };
             let damage_tracker = damage_tracker.as_mut().unwrap();
-            let extra_negotiation_result = extra_negotiation_result.clone();
+            let extra_negotiation_result = *extra_negotiation_result;
             let alpha = *alpha;
 
             unsafe {
@@ -916,7 +919,11 @@ impl Cast {
                                 warn!("error rendering to dmabuf: {err:?}");
                                 self.inner.borrow_mut().state.invalidate_damage();
                                 self.return_unused_buffer(pw_buffer);
-                                recovery::schedule_shm_fallback(&self.event_loop, &mut self.inner.borrow_mut(), self.stream_id);
+                                recovery::schedule_shm_fallback(
+                                    &self.event_loop,
+                                    &mut self.inner.borrow_mut(),
+                                    self.stream_id,
+                                );
                                 false
                             }
                         }
@@ -931,8 +938,21 @@ impl Cast {
                             Fourcc::Xrgb8888
                         };
 
-                        match render_to_shmbuf(renderer, &mut self.shm_staging, &shmbuf, crate::render_helpers::ReadbackFrame { size: size, scale: scale, transform: Transform::Normal, fourcc: fourcc, elements: elements }) {
-                            Ok((readback, fence)) => self.submit_shm_readback(pw_buffer, readback, fence, renderer),
+                        match render_to_shmbuf(
+                            renderer,
+                            &mut self.shm_staging,
+                            &shmbuf,
+                            crate::render_helpers::ReadbackFrame {
+                                size,
+                                scale,
+                                transform: Transform::Normal,
+                                fourcc,
+                                elements,
+                            },
+                        ) {
+                            Ok((readback, fence)) => {
+                                self.submit_shm_readback(pw_buffer, readback, fence, renderer)
+                            }
                             Err(err) => {
                                 warn!("error rendering to shmbuf: {err:?}");
                                 self.inner.borrow_mut().state.invalidate_damage();
@@ -952,6 +972,9 @@ impl Cast {
 
     pub fn dequeue_buffer_and_clear(&mut self, renderer: &mut GlesRenderer) -> bool {
         let mut inner = self.inner.borrow_mut();
+        if inner.stopping {
+            return false;
+        }
         if !inner.pending_shm.is_empty() {
             inner.state.invalidate_damage();
             inner.waiting_for_buffer = true;
@@ -1000,7 +1023,11 @@ impl Cast {
                     Err(err) => {
                         warn!("error clearing dmabuf: {err:?}");
                         self.return_unused_buffer(pw_buffer);
-                        recovery::schedule_shm_fallback(&self.event_loop, &mut self.inner.borrow_mut(), self.stream_id);
+                        recovery::schedule_shm_fallback(
+                            &self.event_loop,
+                            &mut self.inner.borrow_mut(),
+                            self.stream_id,
+                        );
                         false
                     }
                 }
@@ -1059,7 +1086,13 @@ impl Drop for Cast {
 impl CastState {
     /// A resumed consumer or a new buffer pool needs a frame even on a static scene.
     fn invalidate_damage(&mut self) {
-        if let Self::Ready { damage_tracker, cursor_damage_tracker, last_cursor_location, .. } = self {
+        if let Self::Ready {
+            damage_tracker,
+            cursor_damage_tracker,
+            last_cursor_location,
+            ..
+        } = self
+        {
             *damage_tracker = None;
             *cursor_damage_tracker = None;
             *last_cursor_location = None;
@@ -1189,11 +1222,17 @@ fn export_pending_fence(sync: &SyncPoint) -> anyhow::Result<Option<std::os::fd::
     Ok(None)
 }
 
-unsafe fn return_unused_buffer(stream: &Stream, pw_buffer: NonNull<pw_buffer>) -> anyhow::Result<()> {
+unsafe fn return_unused_buffer(
+    stream: &Stream,
+    pw_buffer: NonNull<pw_buffer>,
+) -> anyhow::Result<()> {
     // pw_stream_return_buffer() requires too new PipeWire (1.4.0). So, mark as
     // corrupted and queue.
     mark_buffer_corrupted(pw_buffer);
-    delivery::check_queue_result(pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer.as_ptr()))
+    delivery::check_queue_result(pw_stream_queue_buffer(
+        stream.as_raw_ptr(),
+        pw_buffer.as_ptr(),
+    ))
 }
 
 unsafe fn mark_buffer_corrupted(pw_buffer: NonNull<pw_buffer>) {
@@ -1253,6 +1292,9 @@ unsafe fn mark_buffer_after_render(
         // Clear the corrupted flag we may have set before.
         (*header).flags = 0;
         (*header).seq = *sequence;
+        // Reused buffers must carry this frame's timestamp, not their allocation-time value.
+        (*header).pts = i64::try_from(get_monotonic_time().as_nanos()).unwrap_or(i64::MAX);
+        (*header).dts_offset = 0;
     }
 }
 
