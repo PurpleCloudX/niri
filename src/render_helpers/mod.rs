@@ -185,7 +185,7 @@ pub fn create_texture(
 #[derive(Debug, Default)]
 pub struct StagingTexture {
     texture: Option<GlesTexture>,
-    size: Option<(Size<i32, Physical>, Fourcc)>,
+    size: Option<(Size<i32, Physical>, Fourcc, smithay::backend::renderer::ContextId<GlesTexture>)>,
 }
 
 impl StagingTexture {
@@ -195,9 +195,10 @@ impl StagingTexture {
         size: Size<i32, Physical>,
         fourcc: Fourcc,
     ) -> Result<&mut GlesTexture, GlesError> {
-        if self.size != Some((size, fourcc)) {
+        let key = (size, fourcc, renderer.context_id());
+        if self.size.as_ref() != Some(&key) {
             self.texture = Some(create_texture(renderer, size, fourcc)?);
-            self.size = Some((size, fourcc));
+            self.size = Some(key);
         }
         Ok(self.texture.as_mut().expect("staging texture was created"))
     }
