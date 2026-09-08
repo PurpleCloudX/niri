@@ -1,0 +1,186 @@
+use std::os::fd::AsFd;
+use std::rc::Rc;
+
+use anyhow::{ensure, Context as _};
+use pipewire::spa::sys::{spa_chunk, SPA_CHUNK_FLAG_NONE};
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::RenderElement;
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::ExportMem;
+use smithay::reexports::rustix;
+use smithay::utils::{Physical, Scale, Size, Transform};
+
+use super::shm_mapping::ShmMapping;
+use crate::render_helpers::StagingTexture;
+
+const SHM_BYTES_PER_PIXEL: usize = 4;
+
+#[derive(Debug, Clone)]
+pub(super) struct Shmbuf {
+    pub(super) fd: Rc<rustix::fd::OwnedFd>,
+    pub(super) layout: ShmLayout,
+    mapping: Rc<ShmMapping>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ShmLayout {
+    pub(super) stride: i32,
+    pub(super) size: u32,
+}
+
+impl ShmLayout {
+    pub(super) fn new(size: Size<u32, Physical>) -> anyhow::Result<Self> {
+        ensure!(size.w > 0 && size.h > 0, "empty SHM frame");
+        let stride = size
+            .w
+            .checked_mul(SHM_BYTES_PER_PIXEL as u32)
+            .context("SHM stride overflows u32")?;
+        let buffer_size = stride
+            .checked_mul(size.h)
+            .context("SHM buffer size overflows u32")?;
+        // Smithay GLES readback calculates the byte length using signed i32 arithmetic.
+        i32::try_from(buffer_size).context("SHM frame exceeds GLES readback limit")?;
+
+        Ok(Self {
+            stride: stride.try_into().context("SHM stride exceeds i32")?,
+            size: buffer_size,
+        })
+    }
+
+    pub(super) fn size_usize(self) -> usize {
+        self.size as usize
+    }
+
+    pub(super) fn matches(self, size: Size<i32, Physical>) -> bool {
+        let (Ok(width), Ok(height)) = (u32::try_from(size.w), u32::try_from(size.h)) else {
+            return false;
+        };
+        Self::new(Size::from((width, height))).is_ok_and(|layout| layout == self)
+    }
+}
+
+pub(super) fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbuf> {
+    let layout = ShmLayout::new(size)?;
+    let fd = rustix::fs::memfd_create(
+        "shm_buffer",
+        rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+    )
+    .context("error creating memfd")?;
+    let _ = rustix::fs::ftruncate(&fd, layout.size.into()).context("error set size of the fd")?;
+    let _ = rustix::fs::fcntl_add_seals(
+        &fd,
+        rustix::fs::SealFlags::SEAL | rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW,
+    )
+    .context("error sealing the fd")?;
+    let mapping = Rc::new(ShmMapping::new(fd.as_fd(), layout.size_usize())?);
+    Ok(Shmbuf {
+        fd: fd.into(),
+        layout,
+        mapping,
+    })
+}
+
+pub(super) fn render_to_shmbuf(
+    renderer: &mut GlesRenderer,
+    staging: &mut StagingTexture,
+    buffer: &Shmbuf,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    transform: Transform,
+    fourcc: Fourcc,
+    elements: &[impl RenderElement<GlesRenderer>],
+) -> anyhow::Result<()> {
+    ensure!(buffer.layout.matches(size), "invalid SHM buffer layout");
+    let mapping =
+        staging.render_and_download(renderer, size, scale, transform, fourcc, elements)?;
+    let bytes = renderer
+        .map_texture(&mapping)
+        .context("error mapping texture")?;
+
+    ensure!(
+        bytes.len() >= buffer.layout.size_usize(),
+        "SHM readback is shorter than the frame"
+    );
+
+    buffer
+        .mapping
+        .copy_frame(&bytes[..buffer.layout.size_usize()])
+}
+
+pub(super) fn mark_shm_chunk_rendered(chunk: &mut spa_chunk, layout: ShmLayout) {
+    chunk.offset = 0;
+    chunk.size = layout.size;
+    chunk.stride = layout.stride;
+    chunk.flags = SPA_CHUNK_FLAG_NONE as i32;
+}
+
+pub(super) fn clear_shmbuf(shmbuf: &Shmbuf) -> anyhow::Result<()> {
+    shmbuf.mapping.clear();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pipewire::spa::sys::SPA_CHUNK_FLAG_CORRUPTED;
+
+    #[test]
+    fn shm_mapping_survives_buffer_clone_and_reuses_storage() {
+        use std::io::Read;
+        let buffer = allocate_shmbuf(Size::from((2, 2))).unwrap();
+        let retained = buffer.clone();
+        drop(buffer);
+        assert!(retained.mapping.copy_frame(&[1; 15]).is_err());
+        retained.mapping.copy_frame(&[42; 16]).unwrap();
+        let read = || {
+            let fd = retained.fd.try_clone().unwrap();
+            let mut file = std::fs::File::from(fd);
+            use std::io::{Seek, SeekFrom};
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            bytes
+        };
+        assert_eq!(read(), vec![42; 16]);
+        retained.mapping.clear();
+        assert_eq!(read(), vec![0; 16]);
+        retained.mapping.copy_frame(&[7; 16]).unwrap();
+        assert_eq!(read(), vec![7; 16]);
+    }
+
+    #[test]
+    fn shm_layout_uses_spa_representable_dimensions() {
+        let layout = ShmLayout::new(Size::from((3840, 2160))).unwrap();
+        assert_eq!(layout.stride, 15360);
+        assert_eq!(layout.size, 33_177_600);
+
+        assert!(ShmLayout::new(Size::from((536_870_912, 1))).is_err());
+        assert!(ShmLayout::new(Size::from((500_000_000, 3))).is_err());
+        assert!(ShmLayout::new(Size::from((0, 1))).is_err());
+        assert!(ShmLayout::new(Size::from((1, 0))).is_err());
+        assert!(layout.matches(Size::from((3840, 2160))));
+        assert!(!layout.matches(Size::from((1920, 4320))));
+        let mut invalid_size = Size::from((1, 2160));
+        invalid_size.w = -1;
+        assert!(!layout.matches(invalid_size));
+        assert!(!layout.matches(Size::from((i32::MAX, i32::MAX))));
+    }
+
+    #[test]
+    fn rendered_shm_chunk_covers_the_full_buffer() {
+        let layout = ShmLayout::new(Size::from((3840, 2160))).unwrap();
+        let mut chunk = spa_chunk {
+            offset: 42,
+            size: 1,
+            stride: -1,
+            flags: SPA_CHUNK_FLAG_CORRUPTED as i32,
+        };
+
+        mark_shm_chunk_rendered(&mut chunk, layout);
+
+        assert_eq!(chunk.offset, 0);
+        assert_eq!(chunk.size, 33_177_600);
+        assert_eq!(chunk.stride, 15360);
+        assert_eq!(chunk.flags, SPA_CHUNK_FLAG_NONE as i32);
+    }
+}
