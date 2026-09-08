@@ -54,7 +54,7 @@ use zbus::object_server::SignalEmitter;
 use crate::dbus::mutter_screen_cast::{self, CursorMode};
 use crate::niri::{CastTarget, State};
 use crate::render_helpers::{
-    clear_dmabuf, encompassing_geo, render_and_download, render_to_dmabuf,
+    clear_dmabuf, encompassing_geo, render_and_download, render_to_dmabuf, StagingTexture,
 };
 use crate::screencasting::CastRenderElement;
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
@@ -102,6 +102,7 @@ pub struct Cast {
     cursor_mode: CursorMode,
     pub last_frame_time: Duration,
     scheduled_redraw: Option<RegistrationToken>,
+    shm_staging: StagingTexture,
     // Incremented once per successful frame, stored in buffer meta.
     sequence_counter: u64,
     inner: Rc<RefCell<CastInner>>,
@@ -685,7 +686,7 @@ impl PipeWire {
                                             ..
                                         } if *alpha == format_has_alpha
                                             && matches!(
-                                                extra_negotiation_result, 
+                                                extra_negotiation_result,
                                                 Some(x) if x.modifier == Modifier::from(format.modifier())
                                             ) =>
                                         {
@@ -1052,6 +1053,7 @@ impl PipeWire {
             cursor_mode,
             last_frame_time: Duration::ZERO,
             scheduled_redraw: None,
+            shm_staging: StagingTexture::default(),
             sequence_counter: 0,
             inner,
         };
@@ -1434,6 +1436,7 @@ impl Cast {
 
                         match render_to_shmbuf(
                             renderer,
+                            &mut self.shm_staging,
                             &shmbuf,
                             size,
                             scale,
@@ -1784,6 +1787,7 @@ unsafe fn find_meta_header(buffer: *mut spa_buffer) -> Option<NonNull<spa_meta_h
 
 fn render_to_shmbuf(
     renderer: &mut GlesRenderer,
+    staging: &mut StagingTexture,
     buffer: &Shmbuf,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
@@ -1799,10 +1803,16 @@ fn render_to_shmbuf(
         ),
         "invalid SHM buffer layout"
     );
-    let mapping = render_and_download(renderer, size, scale, transform, fourcc, elements)?;
+    let mapping =
+        staging.render_and_download(renderer, size, scale, transform, fourcc, elements)?;
     let bytes = renderer
         .map_texture(&mapping)
         .context("error mapping texture")?;
+
+    ensure!(
+        bytes.len() >= buffer.layout.size_usize(),
+        "SHM readback is shorter than the frame"
+    );
 
     unsafe {
         let buf = rustix::mm::mmap(
