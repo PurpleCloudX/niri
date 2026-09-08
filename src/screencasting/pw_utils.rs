@@ -1484,7 +1484,7 @@ impl Cast {
                             scale,
                             Transform::Normal,
                             fourcc,
-                            elements.iter().rev(),
+                            elements,
                         ) {
                             Ok(()) => {
                                 mark_buffer_after_render(
@@ -1889,7 +1889,7 @@ fn render_to_shmbuf(
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+    elements: &[impl RenderElement<GlesRenderer>],
 ) -> anyhow::Result<()> {
     ensure!(buffer.layout.matches(size), "invalid SHM buffer layout");
     let mapping =
