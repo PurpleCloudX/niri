@@ -3,6 +3,31 @@ use super::formats::{make_pod, make_video_params_for_initial_negotiation_with_ex
 use super::*;
 
 #[test]
+fn removing_a_ready_fence_source_closes_fd_and_cancels_callback() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let token = event_loop.handle().insert_source(
+        Generic::new(reader, Interest::READ, Mode::OneShot),
+        |_, _, calls| {
+            *calls += 1;
+            Ok(PostAction::Remove)
+        },
+    ).unwrap();
+    writer.write_all(&[1]).unwrap();
+    event_loop.handle().remove(token);
+    let mut calls = 0;
+    event_loop.dispatch(Duration::ZERO, &mut calls).unwrap();
+    assert_eq!(calls, 0);
+    // Closing a socket with unread data can yield reset rather than EOF.
+    let result = writer.read(&mut [0]);
+    assert!(matches!(result, Ok(0)) || result.is_err_and(|err| err.kind() == std::io::ErrorKind::ConnectionReset));
+}
+
+#[test]
 fn fence_completing_during_failed_export_is_deliverable() {
     use smithay::backend::renderer::sync::{Fence, Interrupted};
     use std::sync::atomic::{AtomicBool, Ordering};
