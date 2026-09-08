@@ -109,6 +109,7 @@ pub struct Cast {
 #[derive(Debug)]
 struct CastInner {
     is_active: bool,
+    waiting_for_buffer: bool,
     node_id: Option<u32>,
     state: CastState,
     refresh: u32,
@@ -312,6 +313,7 @@ impl PipeWire {
         // Like in good old wayland-rs times...
         let inner = Rc::new(RefCell::new(CastInner {
             is_active: false,
+            waiting_for_buffer: false,
             node_id: None,
             state: CastState::ResizePending { pending_size },
             refresh,
@@ -327,6 +329,17 @@ impl PipeWire {
 
         let listener = stream
             .add_local_listener_with_user_data(())
+            .process({
+                let inner = inner.clone();
+                let redraw = redraw.clone();
+                move |_, ()| {
+                    let mut inner = inner.borrow_mut();
+                    if inner.is_active && mem::take(&mut inner.waiting_for_buffer) {
+                        drop(inner);
+                        redraw();
+                    }
+                }
+            })
             .state_changed({
                 let inner = inner.clone();
                 let stop_cast = stop_cast.clone();
@@ -358,6 +371,7 @@ impl PipeWire {
                             }
 
                             inner.is_active = false;
+                            inner.waiting_for_buffer = false;
                         }
                         StreamState::Error(_) => {
                             if inner.is_active {
@@ -889,8 +903,12 @@ impl Cast {
 
             let Some(pw_buffer) = self.dequeue_available_buffer() else {
                 warn!("no available buffer in pw stream, skipping frame");
+                let mut inner = self.inner.borrow_mut();
+                inner.state.invalidate_damage();
+                inner.waiting_for_buffer = true;
                 return false;
             };
+            self.inner.borrow_mut().waiting_for_buffer = false;
             let buffer = pw_buffer.as_ptr();
 
             let mut inner = self.inner.borrow_mut();
@@ -940,6 +958,7 @@ impl Cast {
                             }
                             Err(err) => {
                                 warn!("error rendering to dmabuf: {err:?}");
+                                self.inner.borrow_mut().state.invalidate_damage();
                                 return_unused_buffer(&self.stream, pw_buffer);
                                 false
                             }
@@ -977,6 +996,7 @@ impl Cast {
                             }
                             Err(err) => {
                                 warn!("error rendering to shmbuf: {err:?}");
+                                self.inner.borrow_mut().state.invalidate_damage();
                                 return_unused_buffer(&self.stream, pw_buffer);
                                 false
                             }

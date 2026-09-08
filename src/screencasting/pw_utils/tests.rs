@@ -3,6 +3,37 @@ use super::formats::{make_pod, make_video_params_for_initial_negotiation_with_ex
 use super::*;
 
 #[test]
+fn invalidating_an_undelivered_frame_restores_static_scene_damage() {
+    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+    use smithay::backend::renderer::element::Kind;
+
+    let buffer = SolidColorBuffer::new((16.0, 8.0), [1.0, 0.0, 0.0, 1.0]);
+    let elements = [SolidColorRenderElement::from_buffer(
+        &buffer, (0.0, 0.0), 1.0, Kind::Unspecified,
+    )];
+    let mut state = CastState::Ready {
+        size: Size::from((16, 8)),
+        alpha: false,
+        extra_negotiation_result: None,
+        damage_tracker: None,
+        cursor_damage_tracker: None,
+        last_cursor_location: None,
+    };
+    let damaged = |state: &mut CastState| {
+        let CastState::Ready { damage_tracker, .. } = state else { unreachable!() };
+        damage_tracker
+            .get_or_insert_with(|| OutputDamageTracker::new((16, 8), 1.0, Transform::Normal))
+            .damage_output(1, &elements)
+            .unwrap().0.is_some()
+    };
+    assert!(damaged(&mut state));
+    assert!(!damaged(&mut state));
+    state.invalidate_damage();
+    assert!(damaged(&mut state));
+    assert!(!damaged(&mut state));
+}
+
+#[test]
 fn resuming_clears_damage_history_without_changing_negotiated_layout() {
     let size = Size::from((16, 8));
     let mut state = CastState::Ready {
