@@ -1,6 +1,40 @@
 use super::formats::modifier_choice_needs_fixation;
 use super::formats::{make_pod, make_video_params_for_initial_negotiation_with_extra_buffer};
 use super::*;
+
+#[test]
+fn resuming_clears_damage_history_without_changing_negotiated_layout() {
+    let size = Size::from((16, 8));
+    let mut state = CastState::Ready {
+        size,
+        alpha: false,
+        extra_negotiation_result: Some(DmaNegotiationResult {
+            modifier: Modifier::Linear,
+            plane_count: 1,
+        }),
+        damage_tracker: Some(OutputDamageTracker::new((16, 8), 1.0, Transform::Normal)),
+        cursor_damage_tracker: Some(OutputDamageTracker::new((16, 8), 1.0, Transform::Normal)),
+        last_cursor_location: Some(Point::from((4, 4))),
+    };
+    state.invalidate_damage();
+    let CastState::Ready {
+        size: actual_size,
+        alpha,
+        extra_negotiation_result,
+        damage_tracker,
+        cursor_damage_tracker,
+        last_cursor_location,
+    } = state
+    else {
+        panic!("negotiation state changed")
+    };
+    assert_eq!(actual_size, size);
+    assert!(!alpha);
+    assert_eq!(extra_negotiation_result.unwrap().modifier, Modifier::Linear);
+    assert!(damage_tracker.is_none());
+    assert!(cursor_damage_tracker.is_none());
+    assert!(last_cursor_location.is_none());
+}
 use pipewire::spa::{
     self,
     param::format::FormatProperties,

@@ -369,6 +369,7 @@ impl PipeWire {
                         StreamState::Connecting => (),
                         StreamState::Streaming => {
                             inner.is_active = true;
+                            inner.state.invalidate_damage();
                             redraw();
                         }
                     }
@@ -455,8 +456,11 @@ impl PipeWire {
 
                                     // During size re-negotiation, the stream sometimes just keeps running, in
                                     // which case we may need to force a redraw once we got a newly sized buffer.
-                                    if inner.dmabufs.len() == 1 && stream.state() == StreamState::Streaming {
-                                        redraw_();
+                                    if inner.dmabufs.len() == 1 {
+                                        inner.state.invalidate_damage();
+                                        if stream.state() == StreamState::Streaming {
+                                            redraw_();
+                                        }
                                     }
                                 },
                                 None => {
@@ -487,8 +491,11 @@ impl PipeWire {
                                         assert!(inner.shmbufs.insert(fd, shmbuf).is_none());
                                     }
                                     // A resize may leave the stream running without a state change.
-                                    if inner.shmbufs.len() == 1 && stream.state() == StreamState::Streaming {
-                                        redraw_();
+                                    if inner.shmbufs.len() == 1 {
+                                        inner.state.invalidate_damage();
+                                        if stream.state() == StreamState::Streaming {
+                                            redraw_();
+                                        }
                                     }
                                 }
                             }
@@ -1075,6 +1082,15 @@ impl Cast {
 }
 
 impl CastState {
+    /// A resumed consumer or a new buffer pool needs a frame even on a static scene.
+    fn invalidate_damage(&mut self) {
+        if let Self::Ready { damage_tracker, cursor_damage_tracker, last_cursor_location, .. } = self {
+            *damage_tracker = None;
+            *cursor_damage_tracker = None;
+            *last_cursor_location = None;
+        }
+    }
+
     fn pending_size(&self) -> Option<Size<u32, Physical>> {
         match self {
             CastState::ResizePending { pending_size } => Some(*pending_size),
