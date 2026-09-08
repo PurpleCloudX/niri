@@ -64,6 +64,7 @@ const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
 const SHM_BLOCKS: usize = 1;
 const SHM_BYTES_PER_PIXEL: usize = 4;
 mod dmabuf_layout;
+mod modifier_selection;
 mod shm_mapping;
 use shm_mapping::ShmMapping;
 
@@ -1676,16 +1677,17 @@ fn find_preferred_modifier(
 ) -> anyhow::Result<(Modifier, usize)> {
     debug!("find_preferred_modifier: size={size:?}, fourcc={fourcc}, modifiers={modifiers:?}");
 
-    let (buffer, modifier) = allocate_buffer(gbm, size, fourcc, &modifiers)?;
+    modifier_selection::try_modifiers(&modifiers, |offered| {
+        let (buffer, modifier) = allocate_buffer(gbm, size, fourcc, offered)?;
+        let dmabuf = buffer
+            .export()
+            .context("error exporting GBM buffer object as dmabuf")?;
+        let plane_count = dmabuf.num_planes();
 
-    let dmabuf = buffer
-        .export()
-        .context("error exporting GBM buffer object as dmabuf")?;
-    let plane_count = dmabuf.num_planes();
+        // FIXME: Ideally this also needs to try binding the dmabuf for rendering.
 
-    // FIXME: Ideally this also needs to try binding the dmabuf for rendering.
-
-    Ok((modifier, plane_count))
+        Ok((modifier, plane_count))
+    })
 }
 
 fn allocate_buffer(
