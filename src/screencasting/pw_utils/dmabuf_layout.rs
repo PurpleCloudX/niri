@@ -1,11 +1,12 @@
 use std::os::fd::BorrowedFd;
 
 use anyhow::{ensure, Context as _};
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::reexports::rustix::fs::{seek, SeekFrom};
 
 /// Query the backing object's size, including padding and auxiliary planes.
 /// A tiled buffer's allocation size cannot be inferred from width and height.
-pub(super) fn backing_size(fd: BorrowedFd<'_>, offset: u32) -> anyhow::Result<u32> {
+fn backing_size(fd: BorrowedFd<'_>, offset: u32) -> anyhow::Result<u32> {
     let size = seek(fd, SeekFrom::End(0)).context("error querying DMA-BUF size")?;
     seek(fd, SeekFrom::Start(0)).context("error resetting DMA-BUF position")?;
     let size = u32::try_from(size).context("DMA-BUF exceeds SPA size range")?;
@@ -14,6 +15,14 @@ pub(super) fn backing_size(fd: BorrowedFd<'_>, offset: u32) -> anyhow::Result<u3
         "DMA-BUF plane offset exceeds backing storage"
     );
     Ok(size)
+}
+
+pub(super) fn plane_sizes(dmabuf: &Dmabuf) -> anyhow::Result<Vec<u32>> {
+    dmabuf
+        .handles()
+        .zip(dmabuf.offsets())
+        .map(|(fd, offset)| backing_size(fd, offset))
+        .collect()
 }
 
 #[cfg(test)]

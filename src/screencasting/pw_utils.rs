@@ -943,6 +943,14 @@ impl PipeWire {
 
                                         let plane_count = dmabuf.num_planes();
                                         assert_eq!((*spa_buffer).n_datas as usize, plane_count);
+                                        let plane_sizes = match dmabuf_layout::plane_sizes(&dmabuf) {
+                                            Ok(sizes) => sizes,
+                                            Err(err) => {
+                                                warn!("invalid DMA-BUF plane layout: {err:?}");
+                                                stop_cast();
+                                                return;
+                                            }
+                                        };
 
                                         for (i, (fd, (stride, offset))) in
                                             zip(dmabuf.handles(), zip(dmabuf.strides(), dmabuf.offsets()))
@@ -955,14 +963,7 @@ impl PipeWire {
 
                                             // GStreamer also uses this extent to locate linear video
                                             // planes. Publish the allocation size, not a one-byte sentinel.
-                                            (*spa_data).maxsize = match dmabuf_layout::backing_size(fd, offset) {
-                                                Ok(size) => size,
-                                                Err(err) => {
-                                                    warn!("invalid DMA-BUF plane layout: {err:?}");
-                                                    stop_cast();
-                                                    return;
-                                                }
-                                            };
+                                            (*spa_data).maxsize = plane_sizes[i];
                                             (*spa_data).fd = fd.as_raw_fd() as i64;
                                             (*spa_data).flags = SPA_DATA_FLAG_READWRITE;
 
@@ -1682,6 +1683,7 @@ fn find_preferred_modifier(
         let dmabuf = buffer
             .export()
             .context("error exporting GBM buffer object as dmabuf")?;
+        dmabuf_layout::plane_sizes(&dmabuf)?;
         let plane_count = dmabuf.num_planes();
 
         // FIXME: Ideally this also needs to try binding the dmabuf for rendering.
