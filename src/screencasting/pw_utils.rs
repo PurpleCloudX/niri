@@ -7,7 +7,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::Duration;
-use std::{mem, ptr, slice};
+use std::{mem, slice};
 
 use anyhow::ensure;
 use anyhow::Context as _;
@@ -63,6 +63,8 @@ use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
 const SHM_BLOCKS: usize = 1;
 const SHM_BYTES_PER_PIXEL: usize = 4;
+mod shm_mapping;
+use shm_mapping::ShmMapping;
 
 const CURSOR_FORMAT: spa_video_format = SPA_VIDEO_FORMAT_BGRA;
 const CURSOR_BPP: u32 = 4;
@@ -1658,6 +1660,7 @@ fn allocate_dmabuf(
 pub struct Shmbuf {
     fd: Rc<rustix::fd::OwnedFd>,
     layout: ShmLayout,
+    mapping: Rc<ShmMapping>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1713,9 +1716,11 @@ fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbuf> {
         rustix::fs::SealFlags::SEAL | rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW,
     )
     .context("error sealing the fd")?;
+    let mapping = Rc::new(ShmMapping::new(fd.as_fd(), layout.size_usize())?);
     Ok(Shmbuf {
         fd: fd.into(),
         layout,
+        mapping,
     })
 }
 
@@ -1795,10 +1800,7 @@ fn render_to_shmbuf(
     fourcc: Fourcc,
     elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
 ) -> anyhow::Result<()> {
-    ensure!(
-        buffer.layout.matches(size),
-        "invalid SHM buffer layout"
-    );
+    ensure!(buffer.layout.matches(size), "invalid SHM buffer layout");
     let mapping =
         staging.render_and_download(renderer, size, scale, transform, fourcc, elements)?;
     let bytes = renderer
@@ -1810,19 +1812,9 @@ fn render_to_shmbuf(
         "SHM readback is shorter than the frame"
     );
 
-    unsafe {
-        let buf = rustix::mm::mmap(
-            std::ptr::null_mut(),
-            buffer.layout.size_usize(),
-            rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
-            rustix::mm::MapFlags::SHARED,
-            buffer.fd.clone(),
-            0,
-        )?;
-        ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast(), buffer.layout.size_usize());
-        let _ = rustix::mm::munmap(buf, buffer.layout.size_usize()).unwrap();
-    }
-    Ok(())
+    buffer
+        .mapping
+        .copy_frame(&bytes[..buffer.layout.size_usize()])
 }
 
 unsafe fn add_invisible_cursor(spa_buffer: *mut spa_buffer) {
@@ -1969,25 +1961,37 @@ unsafe fn add_cursor_metadata(
 }
 
 fn clear_shmbuf(shmbuf: &Shmbuf) -> anyhow::Result<()> {
-    let bytes: Vec<u8> = vec![0u8; shmbuf.layout.size_usize()];
-    unsafe {
-        let buf = rustix::mm::mmap(
-            std::ptr::null_mut(),
-            shmbuf.layout.size_usize(),
-            rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
-            rustix::mm::MapFlags::SHARED,
-            shmbuf.fd.clone(),
-            0,
-        )?;
-        ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast(), shmbuf.layout.size_usize());
-        let _ = rustix::mm::munmap(buf, shmbuf.layout.size_usize()).unwrap();
-    }
+    shmbuf.mapping.clear();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shm_mapping_survives_buffer_clone_and_reuses_storage() {
+        use std::io::Read;
+        let buffer = allocate_shmbuf(Size::from((2, 2))).unwrap();
+        let retained = buffer.clone();
+        drop(buffer);
+        assert!(retained.mapping.copy_frame(&[1; 15]).is_err());
+        retained.mapping.copy_frame(&[42; 16]).unwrap();
+        let read = || {
+            let fd = retained.fd.try_clone().unwrap();
+            let mut file = std::fs::File::from(fd);
+            use std::io::{Seek, SeekFrom};
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            bytes
+        };
+        assert_eq!(read(), vec![42; 16]);
+        retained.mapping.clear();
+        assert_eq!(read(), vec![0; 16]);
+        retained.mapping.copy_frame(&[7; 16]).unwrap();
+        assert_eq!(read(), vec![7; 16]);
+    }
 
     #[test]
     fn modifier_choice_is_fixated_when_negotiation_requires_it() {
