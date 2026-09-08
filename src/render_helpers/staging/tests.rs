@@ -6,6 +6,98 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::ExportMem;
 
 #[test]
+#[ignore = "manual partial readback comparison"]
+fn egl_partial_readback_benchmark() {
+    use smithay::backend::renderer::gles::ffi;
+    use std::{ptr, time::Instant};
+    let mut renderer = unsafe {
+        let display = EGLDisplay::new(EGLSurfacelessDisplay).unwrap();
+        GlesRenderer::new(EGLContext::new(&display).unwrap()).unwrap()
+    };
+    let texture =
+        create_texture(&mut renderer, Size::from((1920, 1080)), Fourcc::Argb8888).unwrap();
+    renderer
+        .with_context(|gl| unsafe {
+            let mut fbo = 0;
+            let mut pbo = 0;
+            gl.GenFramebuffers(1, &mut fbo);
+            gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
+            gl.FramebufferTexture2D(
+                ffi::FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                texture.tex_id(),
+                0,
+            );
+            assert_eq!(
+                gl.CheckFramebufferStatus(ffi::FRAMEBUFFER),
+                ffi::FRAMEBUFFER_COMPLETE
+            );
+            gl.GenBuffers(1, &mut pbo);
+            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pbo);
+            gl.BufferData(
+                ffi::PIXEL_PACK_BUFFER,
+                1920 * 1080 * 4,
+                ptr::null(),
+                ffi::STREAM_READ,
+            );
+            let mut destination = vec![0u8; 1920 * 1080 * 4];
+            for round in 0..3 {
+                let mut cases = vec![(1920, 1080), (64, 64), (960, 540), (1920, 540)];
+                if round % 2 == 1 {
+                    cases.reverse();
+                }
+                for (w, h) in cases {
+                    let mut elapsed = std::time::Duration::ZERO;
+                    for frame in 0..120 {
+                        gl.ClearColor(1.0, 0.0, 0.0, 1.0);
+                        gl.Clear(ffi::COLOR_BUFFER_BIT);
+                        let start = Instant::now();
+                        gl.ReadPixels(
+                            0,
+                            0,
+                            w,
+                            h,
+                            ffi::BGRA_EXT,
+                            ffi::UNSIGNED_BYTE,
+                            ptr::null_mut(),
+                        );
+                        let mapped = gl.MapBufferRange(
+                            ffi::PIXEL_PACK_BUFFER,
+                            0,
+                            (w * h * 4) as isize,
+                            ffi::MAP_READ_BIT,
+                        );
+                        assert!(!mapped.is_null());
+                        for row in 0..h as usize {
+                            ptr::copy_nonoverlapping(
+                                mapped.cast::<u8>().add(row * w as usize * 4),
+                                destination.as_mut_ptr().add(row * 1920 * 4),
+                                w as usize * 4,
+                            );
+                        }
+                        assert_eq!(gl.UnmapBuffer(ffi::PIXEL_PACK_BUFFER), ffi::TRUE);
+                        if frame >= 20 {
+                            elapsed += start.elapsed();
+                        }
+                    }
+                    assert_eq!(&destination[..4], &[0, 0, 255, 255]);
+                    assert_eq!(gl.GetError(), ffi::NO_ERROR);
+                    eprintln!(
+                        "partial round={round} size={w}x{h} ms/frame={:.3}",
+                        elapsed.as_secs_f64() * 10.0
+                    );
+                }
+            }
+            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
+            gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
+            gl.DeleteBuffers(1, &pbo);
+            gl.DeleteFramebuffers(1, &fbo);
+        })
+        .unwrap();
+}
+
+#[test]
 #[ignore = "manual PBO allocation comparison; not an end-to-end capture benchmark"]
 fn egl_pbo_reuse_benchmark() {
     use smithay::backend::renderer::gles::ffi;
