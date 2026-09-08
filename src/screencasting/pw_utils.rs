@@ -450,6 +450,11 @@ impl PipeWire {
 
                                             (*spa_data).type_ = DataType::DmaBuf.as_raw();
 
+                                            // With DMA-BUFs, consumers should ignore the maxsize field, and
+                                            // producers are allowed to set it to 0.
+                                            //
+                                            // https://docs.pipewire.org/page_dma_buf.html
+                                            //
                                             // GStreamer also uses this extent to locate linear video
                                             // planes. Publish the allocation size, not a one-byte sentinel.
                                             (*spa_data).maxsize = plane_sizes[i];
@@ -799,6 +804,21 @@ impl Cast {
 
         let mut inner = self.inner.borrow_mut();
 
+        // Original upstream rationale, retained for reference:
+        // There are two main ways this can happen. First is that the SyncPoint is
+        // pre-signalled, then the buffer is already ready and no waiting is needed. Second
+        // is that the SyncPoint is potentially still not signalled, but exporting a fence
+        // fd had failed. In this case, there's not much we can do (perhaps do a blocking
+        // wait for the SyncPoint, which itself might fail).
+        //
+        // So let's hope for the best and mark the buffer as submittable. We do not reuse
+        // the original SyncPoint because if we do hit the second case (when it's not
+        // signalled), then without a sync fd we cannot schedule a queue upon its
+        // completion, effectively going stuck. It's better to queue an incomplete buffer
+        // than getting stuck.
+        //
+        // This fork instead stops capture if an unfinished fence cannot be exported;
+        // it must not publish unfinished pixels or block the compositor thread.
         let sync_fd = export_pending_fence(&sync_point);
         inner.rendering_buffers.push((pw_buffer, sync_point));
         drop(inner);
@@ -1290,6 +1310,16 @@ unsafe fn mark_buffer_after_render(
 
     match buf {
         SharingBuf::DMA(_) => {
+            // Original upstream sentinel policy, retained for reference:
+            // With DMA-BUFs, consumers should ignore the size field, and producers are allowed
+            // to set it to 0.
+            //
+            // https://docs.pipewire.org/page_dma_buf.html
+            //
+            // However, OBS checks for size != 0 as a workaround for old compositor versions,
+            // so we set it to 1.
+            //
+            // This fork publishes the full extent instead of the upstream sentinel.
             // Restore the readable extent after returning an unused/corrupted buffer.
             // GStreamer needs the full extent even though PipeWire permits a sentinel.
             for i in 0..(*spa_buffer).n_datas as usize {
