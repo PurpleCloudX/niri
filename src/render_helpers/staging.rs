@@ -35,6 +35,41 @@ impl StagingTexture {
         fourcc: Fourcc,
         elements: &[impl RenderElement<GlesRenderer>],
     ) -> anyhow::Result<GlesMapping> {
+        self.render_texture(renderer, size, scale, transform, fourcc, elements)?;
+        let target = renderer.bind(self.texture.as_mut().unwrap())?;
+        copy_framebuffer(renderer, &target, fourcc).context("error reading staging texture")
+    }
+
+    pub fn render_and_readback(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        size: Size<i32, Physical>,
+        scale: Scale<f64>,
+        transform: Transform,
+        fourcc: Fourcc,
+        elements: &[impl RenderElement<GlesRenderer>],
+    ) -> anyhow::Result<super::pbo::Readback> {
+        self.render_texture(renderer, size, scale, transform, fourcc, elements)?;
+        if let Some(readback) =
+            super::pbo::try_readback(renderer, self.texture.as_ref().unwrap(), size, fourcc)?
+        {
+            return Ok(readback);
+        }
+        let target = renderer.bind(self.texture.as_mut().unwrap())?;
+        Ok(super::pbo::Readback::Smithay(copy_framebuffer(
+            renderer, &target, fourcc,
+        )?))
+    }
+
+    fn render_texture(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        size: Size<i32, Physical>,
+        scale: Scale<f64>,
+        transform: Transform,
+        fourcc: Fourcc,
+        elements: &[impl RenderElement<GlesRenderer>],
+    ) -> anyhow::Result<()> {
         self.get_or_create(renderer, size, fourcc)?;
         if self
             .damage
@@ -75,7 +110,7 @@ impl StagingTexture {
                 return Err(err).context("error rendering staging texture");
             }
         }
-        copy_framebuffer(renderer, &target, fourcc).context("error reading staging texture")
+        Ok(())
     }
 
     pub fn get_or_create(

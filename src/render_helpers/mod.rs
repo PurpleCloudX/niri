@@ -182,6 +182,7 @@ pub fn create_texture(
 }
 
 mod staging;
+pub mod pbo;
 pub use staging::StagingTexture;
 
 pub fn copy_framebuffer(
