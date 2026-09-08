@@ -6,6 +6,108 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::ExportMem;
 
 #[test]
+#[ignore = "manual PBO allocation comparison; not an end-to-end capture benchmark"]
+fn egl_pbo_reuse_benchmark() {
+    use smithay::backend::renderer::gles::ffi;
+    use std::{ptr, time::Instant};
+
+    let mut renderer = unsafe {
+        let display = EGLDisplay::new(EGLSurfacelessDisplay).unwrap();
+        GlesRenderer::new(EGLContext::new(&display).unwrap()).unwrap()
+    };
+    let texture =
+        create_texture(&mut renderer, Size::from((1920, 1080)), Fourcc::Argb8888).unwrap();
+    renderer
+        .with_context(|gl| unsafe {
+            let mut old_fbo = 0;
+            let mut old_pack = 0;
+            gl.GetIntegerv(ffi::FRAMEBUFFER_BINDING, &mut old_fbo);
+            gl.GetIntegerv(ffi::PIXEL_PACK_BUFFER_BINDING, &mut old_pack);
+            let mut fbo = 0;
+            gl.GenFramebuffers(1, &mut fbo);
+            gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
+            gl.FramebufferTexture2D(
+                ffi::FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                texture.tex_id(),
+                0,
+            );
+            assert_eq!(
+                gl.CheckFramebufferStatus(ffi::FRAMEBUFFER),
+                ffi::FRAMEBUFFER_COMPLETE
+            );
+            gl.ClearColor(1.0, 0.0, 0.0, 1.0);
+            gl.Clear(ffi::COLOR_BUFFER_BIT);
+            let bytes = 1920 * 1080 * 4;
+            let mut destination = vec![0u8; bytes];
+            for round in 0..3 {
+                for reuse in [false, true] {
+                    let mut pbo = 0;
+                    let mut elapsed = std::time::Duration::ZERO;
+                    for frame in 0..120 {
+                        let start = Instant::now();
+                        if !reuse || frame == 0 {
+                            gl.GenBuffers(1, &mut pbo);
+                            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pbo);
+                            gl.BufferData(
+                                ffi::PIXEL_PACK_BUFFER,
+                                bytes as isize,
+                                ptr::null(),
+                                ffi::STREAM_READ,
+                            );
+                        } else {
+                            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pbo);
+                        }
+                        gl.ReadPixels(
+                            0,
+                            0,
+                            1920,
+                            1080,
+                            ffi::RGBA,
+                            ffi::UNSIGNED_BYTE,
+                            ptr::null_mut(),
+                        );
+                        let mapped = gl.MapBufferRange(
+                            ffi::PIXEL_PACK_BUFFER,
+                            0,
+                            bytes as isize,
+                            ffi::MAP_READ_BIT,
+                        );
+                        assert!(!mapped.is_null());
+                        ptr::copy_nonoverlapping(
+                            mapped.cast::<u8>(),
+                            destination.as_mut_ptr(),
+                            bytes,
+                        );
+                        assert_eq!(gl.UnmapBuffer(ffi::PIXEL_PACK_BUFFER), ffi::TRUE);
+                        gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
+                        if !reuse {
+                            gl.DeleteBuffers(1, &pbo);
+                        }
+                        if frame >= 20 {
+                            elapsed += start.elapsed();
+                        }
+                    }
+                    if reuse {
+                        gl.DeleteBuffers(1, &pbo);
+                    }
+                    assert!(destination.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+                    assert_eq!(gl.GetError(), ffi::NO_ERROR);
+                    eprintln!(
+                        "PBO round={round} reuse={reuse} ms/frame={:.3}",
+                        elapsed.as_secs_f64() * 10.0
+                    );
+                }
+            }
+            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, old_pack as u32);
+            gl.BindFramebuffer(ffi::FRAMEBUFFER, old_fbo as u32);
+            gl.DeleteFramebuffers(1, &fbo);
+        })
+        .unwrap();
+}
+
+#[test]
 #[ignore = "manual EGL render/readback microbenchmark, not an end-to-end latency test"]
 fn egl_staging_benchmark() {
     fn measure(renderer: &mut GlesRenderer, cached: bool) -> std::time::Duration {
