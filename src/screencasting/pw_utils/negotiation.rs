@@ -79,6 +79,7 @@ pub(super) fn listener(
         debug!("got format = {format:?}");
 
         let format_size = Size::from((format.size().width, format.size().height));
+        let dma_failed = inner.dma_failed;
 
         let state = &mut inner.state;
         if format_size != state.expected_format_size() {
@@ -126,13 +127,13 @@ pub(super) fn listener(
         let maybe_prop_modifier =
             object.find_prop(spa::utils::Id(FormatProperties::VideoModifier.0));
 
-        if matches!(
+        if (dma_failed || matches!(
             *state,
             CastState::ConfirmationPending {
                 extra_negotiation_result: None,
                 ..
             }
-        ) && maybe_prop_modifier.is_some()
+        )) && maybe_prop_modifier.is_some()
         {
             warn!("consumer returned DMA-BUF after SHM-only negotiation");
             stop_cast();
@@ -430,7 +431,7 @@ pub(super) fn listener(
     }
 }
 
-fn request_shm_fallback(
+pub(super) fn request_shm_fallback(
     stream: &Stream,
     state: &mut CastState,
     size: Size<u32, Physical>,

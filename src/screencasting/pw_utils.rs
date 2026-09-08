@@ -58,6 +58,7 @@ mod negotiation;
 mod shm_buffer;
 mod shm_mapping;
 mod shm_readback;
+mod recovery;
 use shm_buffer::{
     allocate_shmbuf, clear_shmbuf, mark_shm_chunk_rendered, render_to_shmbuf, ShmLayout, Shmbuf,
 };
@@ -110,6 +111,7 @@ pub struct Cast {
 #[derive(Debug)]
 struct CastInner {
     is_active: bool,
+    dma_failed: bool,
     waiting_for_buffer: bool,
     node_id: Option<u32>,
     state: CastState,
@@ -316,6 +318,7 @@ impl PipeWire {
         // Like in good old wayland-rs times...
         let inner = Rc::new(RefCell::new(CastInner {
             is_active: false,
+            dma_failed: false,
             waiting_for_buffer: false,
             node_id: None,
             state: CastState::ResizePending { pending_size },
@@ -401,6 +404,7 @@ impl PipeWire {
             .add_buffer({
                 let inner = inner.clone();
                 let stop_cast = stop_cast.clone();
+                let event_loop = self.event_loop.clone();
                 move |stream, (), buffer| {
                     let _span = debug_span!("add_buffer", %stream_id).entered();
                     let mut inner = inner.borrow_mut();
@@ -428,7 +432,7 @@ impl PipeWire {
                                             Ok(dmabuf) => dmabuf,
                                             Err(err) => {
                                                 warn!("error allocating dmabuf: {err:?}");
-                                                stop_cast();
+                                                recovery::schedule_shm_fallback(&event_loop, &mut inner, stream_id);
                                                 return;
                                             }
                                         };
@@ -439,7 +443,7 @@ impl PipeWire {
                                             Ok(sizes) => sizes,
                                             Err(err) => {
                                                 warn!("invalid DMA-BUF plane layout: {err:?}");
-                                                stop_cast();
+                                                recovery::schedule_shm_fallback(&event_loop, &mut inner, stream_id);
                                                 return;
                                             }
                                         };
@@ -1009,6 +1013,7 @@ impl Cast {
                                 warn!("error rendering to dmabuf: {err:?}");
                                 self.inner.borrow_mut().state.invalidate_damage();
                                 return_unused_buffer(&self.stream, pw_buffer);
+                                recovery::schedule_shm_fallback(&self.event_loop, &mut self.inner.borrow_mut(), self.stream_id);
                                 false
                             }
                         }
@@ -1100,6 +1105,7 @@ impl Cast {
                     Err(err) => {
                         warn!("error clearing dmabuf: {err:?}");
                         return_unused_buffer(&self.stream, pw_buffer);
+                        recovery::schedule_shm_fallback(&self.event_loop, &mut self.inner.borrow_mut(), self.stream_id);
                         false
                     }
                 }
