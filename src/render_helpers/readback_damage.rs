@@ -5,24 +5,35 @@ use smithay::utils::{Physical, Rectangle, Size};
 
 /// Identity of successfully copied content, without wrapping sequence counters.
 #[derive(Debug, Clone)]
-pub struct ContentStamp(Rc<()>);
+pub struct ContentStamp {
+    epoch: Rc<()>,
+    frame: u64,
+}
 
 #[derive(Debug, Default)]
 pub(super) struct ReadbackDamage {
-    frames: VecDeque<(ContentStamp, Option<Rectangle<i32, Physical>>)>,
+    frames: VecDeque<(u64, Option<Rectangle<i32, Physical>>)>,
+    epoch: Rc<()>,
+    sequence: u64,
 }
 
 impl ReadbackDamage {
     pub fn reset(&mut self) {
         self.frames.clear();
+        self.epoch = Rc::new(());
+        self.sequence = 0;
     }
 
     pub fn record(&mut self, damage: &[Rectangle<i32, Physical>]) {
         let bounds = damage.iter().copied().reduce(|a, b| a.merge(b));
-        self.frames.push_back((ContentStamp(Rc::new(())), bounds));
-        if self.frames.len() > 16 {
+        if self.sequence == u64::MAX {
+            self.reset();
+        }
+        self.sequence += 1;
+        if self.frames.len() == 16 {
             self.frames.pop_front();
         }
+        self.frames.push_back((self.sequence, bounds));
     }
 
     pub fn since(
@@ -30,18 +41,14 @@ impl ReadbackDamage {
         stamp: Option<&ContentStamp>,
         size: Size<i32, Physical>,
     ) -> (ContentStamp, Option<Rectangle<i32, Physical>>) {
-        let current = self
-            .frames
-            .back()
-            .expect("record damage before selecting readback")
-            .0
-            .clone();
+        let current = ContentStamp {
+            epoch: self.epoch.clone(),
+            frame: self.sequence,
+        };
         let full = Rectangle::from_size(size);
-        let previous = stamp.and_then(|stamp| {
-            self.frames
-                .iter()
-                .position(|(old, _)| Rc::ptr_eq(&stamp.0, &old.0))
-        });
+        let previous = stamp
+            .filter(|stamp| Rc::ptr_eq(&stamp.epoch, &self.epoch))
+            .and_then(|stamp| self.frames.iter().position(|(old, _)| stamp.frame == *old));
         let Some(previous) = previous else {
             return (current, Some(full));
         };
@@ -70,6 +77,26 @@ impl ReadbackDamage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_wrap_and_reset_never_reuse_old_content_identity() {
+        let mut history = ReadbackDamage::default();
+        let size = Size::from((16, 16));
+        history.record(&[]);
+        let (old, _) = history.since(None, size);
+        history.record(&[]);
+        let (next, _) = history.since(Some(&old), size);
+        assert!(
+            Rc::ptr_eq(&old.epoch, &next.epoch),
+            "ordinary frames must not allocate identities"
+        );
+        history.sequence = u64::MAX;
+        history.record(&[]);
+        let (new, damage) = history.since(Some(&old), size);
+        assert_eq!(new.frame, old.frame);
+        assert!(!Rc::ptr_eq(&new.epoch, &old.epoch));
+        assert_eq!(damage, Some(Rectangle::from_size(size)));
+    }
 
     #[test]
     fn tracks_each_destination_and_bounds_history() {
