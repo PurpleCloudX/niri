@@ -85,7 +85,7 @@ pub enum StreamTargetId {
 #[zvariant(signature = "dict")]
 struct StreamParameters {
     /// Position of the stream in logical coordinates.
-    position: (i32, i32),
+    position: Option<(i32, i32)>,
     /// Size of the stream in logical coordinates.
     size: (i32, i32),
 }
@@ -289,14 +289,14 @@ impl Stream {
             StreamTarget::Output(output) => {
                 let logical = output.logical.as_ref().unwrap();
                 StreamParameters {
-                    position: (logical.x, logical.y),
+                    position: Some((logical.x, logical.y)),
                     size: (logical.width as i32, logical.height as i32),
                 }
             }
             StreamTarget::Window { .. } => {
                 // Does any consumer need this?
                 StreamParameters {
-                    position: (0, 0),
+                    position: None,
                     size: (1, 1),
                 }
             }
