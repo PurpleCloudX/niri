@@ -1425,8 +1425,8 @@ impl Cast {
                 x if x == DataType::MemFd.as_raw() => {
                     let inner = self.inner.borrow();
                     let shmbuf = &inner.shmbufs[&fd];
-                    clear_shmbuf(shmbuf)
-                        .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
+                    clear_shmbuf(shmbuf);
+                    Ok((SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
                 }
                 _ => Err(anyhow::anyhow!(
                     "unknown data type in dequeue_buffer_and_clear"
@@ -1985,9 +1985,8 @@ fn render_to_shmbuf(
     buffer.mapping.copy_frame(bytes)
 }
 
-fn clear_shmbuf(buffer: &Shmbuf) -> anyhow::Result<()> {
+fn clear_shmbuf(buffer: &Shmbuf) {
     buffer.mapping.clear();
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2081,7 +2080,7 @@ mod tests {
         }
         assert!(ftruncate(&buffer.fd, 0).is_err());
         assert!(ftruncate(&buffer.fd, 64).is_err());
-        clear_shmbuf(&buffer).unwrap();
+        clear_shmbuf(&buffer);
         let mut bytes = [1; 32];
         file.read_exact_at(&mut bytes, 0).unwrap();
         assert_eq!(bytes, [0; 32]);
