@@ -68,6 +68,9 @@ const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
 const SHM_BLOCKS: usize = 1;
 const SHM_BYTES_PER_PIXEL: usize = 4;
 
+mod dmabuf_layout;
+mod modifier_selection;
+
 const CURSOR_FORMAT: spa_video_format = SPA_VIDEO_FORMAT_BGRA;
 const CURSOR_BPP: u32 = 4;
 const CURSOR_WIDTH: u32 = 384;
@@ -629,7 +632,7 @@ impl PipeWire {
                                     gbm,
                                     format_size,
                                     fourcc,
-                                    alternatives,
+                                    &alternatives,
                                 ) {
                                     Ok(x) => x,
                                     Err(err) => {
@@ -741,7 +744,7 @@ impl PipeWire {
                                         gbm,
                                         format_size,
                                         fourcc,
-                                        vec![format.modifier() as i64],
+                                        &[format.modifier() as i64],
                                     ) {
                                         Ok(x) => x,
                                         Err(err) => {
@@ -1404,7 +1407,10 @@ impl CastInner {
         };
 
         match dma_negotiation {
-            Some(DmaNegotiation { modifier, .. }) => {
+            Some(DmaNegotiation {
+                modifier,
+                plane_count: negotiated_planes,
+            }) => {
                 trace!(
                     "pw stream: add_buffer (dma), size={size:?}, \
                      alpha={alpha}, modifier={modifier:?}"
@@ -1428,7 +1434,15 @@ impl CastInner {
                         .context("error allocating dmabuf")?;
 
                     let plane_count = dmabuf.num_planes();
-                    assert_eq!((*spa_buffer).n_datas as usize, plane_count);
+                    ensure!(
+                        plane_count == negotiated_planes as usize,
+                        "DMA-BUF plane count changed"
+                    );
+                    ensure!(
+                        (*spa_buffer).n_datas as usize == plane_count,
+                        "invalid PipeWire plane count"
+                    );
+                    let plane_sizes = dmabuf_layout::plane_sizes(&dmabuf)?;
 
                     for (i, (fd, (stride, offset))) in
                         zip(dmabuf.handles(), zip(dmabuf.strides(), dmabuf.offsets())).enumerate()
@@ -1442,7 +1456,8 @@ impl CastInner {
                         // producers are allowed to set it to 0.
                         //
                         // https://docs.pipewire.org/page_dma_buf.html
-                        (*spa_data).maxsize = 1;
+                        // Publish the real backing extent for consumers mapping linear planes.
+                        (*spa_data).maxsize = plane_sizes[i];
                         (*spa_data).fd = fd.as_raw_fd() as i64;
                         (*spa_data).flags = SPA_DATA_FLAG_READWRITE;
 
@@ -1555,20 +1570,22 @@ fn find_preferred_modifier(
     gbm: &GbmDevice<DeviceFd>,
     size: Size<u32, Physical>,
     fourcc: Fourcc,
-    modifiers: Vec<i64>,
+    modifiers: &[i64],
 ) -> anyhow::Result<(Modifier, usize)> {
     debug!("find_preferred_modifier: size={size:?}, fourcc={fourcc}, modifiers={modifiers:?}");
 
-    let (buffer, modifier) = allocate_buffer(gbm, size, fourcc, &modifiers)?;
+    modifier_selection::try_modifiers(modifiers, |offered| {
+        let (buffer, modifier) = allocate_buffer(gbm, size, fourcc, offered)?;
+        let dmabuf = buffer
+            .export()
+            .context("error exporting GBM buffer object as dmabuf")?;
+        let plane_count = dmabuf.num_planes();
+        dmabuf_layout::plane_sizes(&dmabuf)?;
 
-    let dmabuf = buffer
-        .export()
-        .context("error exporting GBM buffer object as dmabuf")?;
-    let plane_count = dmabuf.num_planes();
+        // FIXME: Ideally this also needs to try binding the dmabuf for rendering.
 
-    // FIXME: Ideally this also needs to try binding the dmabuf for rendering.
-
-    Ok((modifier, plane_count))
+        Ok((modifier, plane_count))
+    })
 }
 
 fn allocate_buffer(
@@ -1609,7 +1626,12 @@ fn allocate_dmabuf(
     fourcc: Fourcc,
     modifier: Modifier,
 ) -> anyhow::Result<Dmabuf> {
-    let (buffer, _modifier) = allocate_buffer(gbm, size, fourcc, &[u64::from(modifier) as i64])?;
+    let (buffer, allocated_modifier) =
+        allocate_buffer(gbm, size, fourcc, &[u64::from(modifier) as i64])?;
+    ensure!(
+        allocated_modifier == modifier,
+        "allocated DMA-BUF modifier differs from negotiation"
+    );
     let dmabuf = buffer
         .export()
         .context("error exporting GBM buffer object as dmabuf")?;
@@ -1673,19 +1695,22 @@ fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbuf> {
 unsafe fn return_unused_buffer(stream: &Stream, pw_buffer: NonNull<pw_buffer>) {
     // pw_stream_return_buffer() requires too new PipeWire (1.4.0). So, mark as
     // corrupted and queue.
-    let pw_buffer = pw_buffer.as_ptr();
-    let spa_buffer = (*pw_buffer).buffer;
-    let chunk = (*(*spa_buffer).datas).chunk;
+    mark_buffer_corrupted(pw_buffer);
+    pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer.as_ptr());
+}
+
+unsafe fn mark_buffer_corrupted(pw_buffer: NonNull<pw_buffer>) {
+    let spa_buffer = (*pw_buffer.as_ptr()).buffer;
     // Some (older?) consumers will check for size == 0 instead of the CORRUPTED flag.
-    (*chunk).size = 0;
-    (*chunk).flags = SPA_CHUNK_FLAG_CORRUPTED as i32;
+    for data in slice::from_raw_parts_mut((*spa_buffer).datas, (*spa_buffer).n_datas as usize) {
+        (*data.chunk).size = 0;
+        (*data.chunk).flags = SPA_CHUNK_FLAG_CORRUPTED as i32;
+    }
 
     if let Some(header) = find_meta_header(spa_buffer) {
         let header = header.as_ptr();
         (*header).flags = SPA_META_HEADER_FLAG_CORRUPTED;
     }
-
-    pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer);
 }
 
 unsafe fn mark_buffer_as_good(pw_buffer: NonNull<pw_buffer>, sequence: &mut u64, buf: SharingBuf) {
@@ -1702,9 +1727,14 @@ unsafe fn mark_buffer_as_good(pw_buffer: NonNull<pw_buffer>, sequence: &mut u64,
             //
             // However, OBS checks for size != 0 as a workaround for old compositor versions,
             // so we set it to 1.
-            (*chunk).size = 1;
-            // Clear the corrupted flag we may have set before.
-            (*chunk).flags = SPA_CHUNK_FLAG_NONE as i32;
+            // Restore each plane's full extent, including modifier-specific auxiliary data.
+            for data in
+                slice::from_raw_parts_mut((*spa_buffer).datas, (*spa_buffer).n_datas as usize)
+            {
+                (*data.chunk).size = data.maxsize - (*data.chunk).offset;
+                // Clear the corrupted flag we may have set before.
+                (*data.chunk).flags = SPA_CHUNK_FLAG_NONE as i32;
+            }
         }
         SharingBuf::Shm(shmbuf) => {
             (*chunk).size = shmbuf.layout.size;
@@ -1940,6 +1970,8 @@ fn clear_shmbuf(buffer: &Shmbuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod plane_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
