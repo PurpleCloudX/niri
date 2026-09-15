@@ -56,8 +56,7 @@ use zbus::object_server::SignalEmitter;
 use crate::dbus::mutter_screen_cast::{self, CursorMode};
 use crate::niri::{CastTarget, State};
 use crate::render_helpers::{
-    clear_dmabuf, encompassing_geo, render_and_download, render_and_download_with_damage,
-    render_to_dmabuf,
+    clear_dmabuf, encompassing_geo, render_and_download, render_to_dmabuf, DownloadTexture,
 };
 use crate::screencasting::CastRenderElement;
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
@@ -110,6 +109,7 @@ pub struct Cast {
     cursor_mode: CursorMode,
     frame_pacing: FramePacing,
     scheduled_redraw: Option<RegistrationToken>,
+    shm_texture: DownloadTexture,
     // Incremented once per successful frame, stored in buffer meta.
     sequence_counter: u64,
     inner: Rc<RefCell<CastInner>>,
@@ -974,6 +974,7 @@ impl PipeWire {
             cursor_mode,
             frame_pacing: FramePacing::default(),
             scheduled_redraw: None,
+            shm_texture: DownloadTexture::default(),
             sequence_counter: 0,
             inner,
         };
@@ -1350,8 +1351,16 @@ impl Cast {
                         Fourcc::Xrgb8888
                     };
 
-                    render_to_shmbuf(renderer, damage_tracker, shmbuf, fourcc, elements, states)
-                        .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
+                    render_to_shmbuf(
+                        renderer,
+                        &mut self.shm_texture,
+                        damage_tracker,
+                        shmbuf,
+                        fourcc,
+                        elements,
+                        states,
+                    )
+                    .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
                 }
                 _ => Err(anyhow::anyhow!(
                     "unknown data type in dequeue_buffer_and_render"
@@ -1951,6 +1960,7 @@ unsafe fn add_cursor_metadata(
 
 fn render_to_shmbuf(
     renderer: &mut GlesRenderer,
+    texture: &mut DownloadTexture,
     damage_tracker: &mut OutputDamageTracker,
     buffer: &Shmbuf,
     fourcc: Fourcc,
@@ -1966,7 +1976,7 @@ fn render_to_shmbuf(
     );
 
     let mapping =
-        render_and_download_with_damage(renderer, damage_tracker, fourcc, elements, states)?;
+        texture.render_and_download(renderer, damage_tracker, fourcc, elements, states)?;
 
     let bytes = renderer
         .map_texture(&mapping)
