@@ -68,6 +68,9 @@ const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
 const SHM_BLOCKS: usize = 1;
 const SHM_BYTES_PER_PIXEL: usize = 4;
 
+mod frame_pacing;
+use frame_pacing::FramePacing;
+
 const CURSOR_FORMAT: spa_video_format = SPA_VIDEO_FORMAT_BGRA;
 const CURSOR_BPP: u32 = 4;
 const CURSOR_WIDTH: u32 = 384;
@@ -104,7 +107,7 @@ pub struct Cast {
     formats: FormatSet,
     offer_alpha: bool,
     cursor_mode: CursorMode,
-    pub last_frame_time: Duration,
+    frame_pacing: FramePacing,
     scheduled_redraw: Option<RegistrationToken>,
     // Incremented once per successful frame, stored in buffer meta.
     sequence_counter: u64,
@@ -968,7 +971,7 @@ impl PipeWire {
             formats,
             offer_alpha: alpha,
             cursor_mode,
-            last_frame_time: Duration::ZERO,
+            frame_pacing: FramePacing::default(),
             scheduled_redraw: None,
             sequence_counter: 0,
             inner,
@@ -1042,10 +1045,15 @@ impl Cast {
         Ok(())
     }
 
+    pub fn record_frame_time(&mut self, time: Duration) {
+        let interval = self.inner.borrow().min_time_between_frames;
+        self.frame_pacing.record(time, interval);
+    }
+
     fn compute_extra_delay(&self, target_frame_time: Duration) -> Duration {
         let inner = self.inner.borrow();
 
-        let last = self.last_frame_time;
+        let last = self.frame_pacing.last;
         let min = inner.min_time_between_frames;
 
         if last.is_zero() {
@@ -1063,9 +1071,9 @@ impl Cast {
             return Duration::ZERO;
         }
 
-        let diff = target_frame_time - last;
-        if diff < min {
-            let delay = min - diff;
+        let deadline = self.frame_pacing.deadline(min);
+        if target_frame_time < deadline {
+            let delay = deadline - target_frame_time;
             trace!(
                 ?target_frame_time,
                 ?last,
@@ -1074,7 +1082,7 @@ impl Cast {
             );
             return delay;
         } else {
-            trace!("overshoot={:?}", diff - min);
+            trace!("overshoot={:?}", target_frame_time - deadline);
         }
 
         Duration::ZERO
