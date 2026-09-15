@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::iter::zip;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -115,6 +115,7 @@ pub struct Cast {
 #[derive(Debug)]
 struct CastInner {
     is_active: bool,
+    waiting_for_buffer: bool,
     node_id: Option<u32>,
     state: CastState,
     refresh: u32,
@@ -127,7 +128,7 @@ struct CastInner {
     /// rendering to complete. The completion can be checked from the `SyncPoint`s. The buffers are
     /// stored in order from oldest to newest, and the same ordering should be preserved when
     /// submitting completed buffers to PipeWire.
-    rendering_buffers: Vec<(NonNull<pw_buffer>, SyncPoint)>,
+    rendering_buffers: VecDeque<(NonNull<pw_buffer>, SyncPoint)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -453,18 +454,30 @@ impl PipeWire {
         // Like in good old wayland-rs times...
         let inner = Rc::new(RefCell::new(CastInner {
             is_active: false,
+            waiting_for_buffer: false,
             node_id: None,
             state: CastState::ResizePending { pending_size },
             refresh,
             min_time_between_frames: Duration::ZERO,
             dmabufs: HashMap::new(),
             shmbufs: HashMap::new(),
-            rendering_buffers: Vec::new(),
+            rendering_buffers: VecDeque::new(),
         }));
 
         let listener =
             stream
                 .add_local_listener_with_user_data(())
+                .process({
+                    let inner = inner.clone();
+                    let redraw = redraw.clone();
+                    move |_, ()| {
+                        let mut inner = inner.borrow_mut();
+                        if inner.is_active && mem::take(&mut inner.waiting_for_buffer) {
+                            drop(inner);
+                            redraw();
+                        }
+                    }
+                })
                 .state_changed({
                     let inner = inner.clone();
                     let stop_cast = stop_cast.clone();
@@ -497,6 +510,7 @@ impl PipeWire {
                                 }
 
                                 inner.is_active = false;
+                                inner.waiting_for_buffer = false;
                             }
                             StreamState::Error(_) => {
                                 if inner.is_active {
@@ -508,6 +522,7 @@ impl PipeWire {
                             StreamState::Connecting => (),
                             StreamState::Streaming => {
                                 inner.is_active = true;
+                                inner.state.invalidate_damage();
                                 redraw();
                             }
                         }
@@ -891,7 +906,17 @@ impl PipeWire {
                     move |stream, (), buffer| {
                         let _span = debug_span!("add_buffer", %stream_id).entered();
 
-                        match unsafe { inner.borrow_mut().on_add_buffer(gbm.as_ref(), buffer) } {
+                        let result = unsafe {
+                            let mut inner = inner.borrow_mut();
+                            inner
+                                .on_add_buffer(gbm.as_ref(), buffer)
+                                .inspect(|&redraw| {
+                                    if redraw {
+                                        inner.state.invalidate_damage();
+                                    }
+                                })
+                        };
+                        match result {
                             Ok(redraw) => {
                                 // During size re-negotiation, the stream sometimes just keeps
                                 // running, in which case we may need to force a redraw once we got
@@ -1111,7 +1136,7 @@ impl Cast {
     }
 
     fn queue_completed_buffers(&mut self) {
-        let mut inner = self.inner.borrow_mut();
+        let inner = self.inner.borrow();
 
         // We want to queue buffers in order, so find the first still-rendering buffer, and queue
         // everything up to that. Even if there are completed buffers past the first
@@ -1123,7 +1148,19 @@ impl Cast {
             .position(|(_, sync)| !sync.is_reached())
             .unwrap_or(inner.rendering_buffers.len());
 
-        for (buffer, _) in inner.rendering_buffers.drain(..first_in_progress_idx) {
+        drop(inner);
+        for _ in 0..first_in_progress_idx {
+            let mut inner = self.inner.borrow_mut();
+            if !inner
+                .rendering_buffers
+                .front()
+                .is_some_and(|(_, sync)| sync.is_reached())
+            {
+                break;
+            }
+            let (buffer, _) = inner.rendering_buffers.pop_front().unwrap();
+            // Queuing can re-enter the process callback.
+            drop(inner);
             trace!("queueing completed buffer");
             unsafe {
                 pw_stream_queue_buffer(self.stream.as_raw_ptr(), buffer.as_ptr());
@@ -1156,7 +1193,7 @@ impl Cast {
             }
         };
 
-        inner.rendering_buffers.push((pw_buffer, sync_point));
+        inner.rendering_buffers.push_back((pw_buffer, sync_point));
         drop(inner);
 
         match sync_fd {
@@ -1256,8 +1293,12 @@ impl Cast {
 
         let Some(pw_buffer) = self.dequeue_available_buffer() else {
             warn!("no available buffer in pw stream, skipping frame");
+            let mut inner = self.inner.borrow_mut();
+            inner.state.invalidate_damage();
+            inner.waiting_for_buffer = true;
             return false;
         };
+        self.inner.borrow_mut().waiting_for_buffer = false;
         let buffer = pw_buffer.as_ptr();
 
         let mut inner = self.inner.borrow_mut();
@@ -1318,6 +1359,7 @@ impl Cast {
                 }
                 Err(err) => {
                     warn!("error rendering to buffer: {err:?}");
+                    self.inner.borrow_mut().state.invalidate_damage();
                     return_unused_buffer(&self.stream, pw_buffer);
                     false
                 }
@@ -1342,8 +1384,10 @@ impl Cast {
 
         let Some(pw_buffer) = self.dequeue_available_buffer() else {
             warn!("no available buffer in pw stream, skipping frame");
+            self.inner.borrow_mut().waiting_for_buffer = true;
             return false;
         };
+        self.inner.borrow_mut().waiting_for_buffer = false;
         let buffer = pw_buffer.as_ptr();
 
         unsafe {
@@ -1523,6 +1567,21 @@ impl CastInner {
 }
 
 impl CastState {
+    /// A resumed consumer or a new buffer pool needs a frame even on a static scene.
+    fn invalidate_damage(&mut self) {
+        if let Self::Ready {
+            damage_tracker,
+            cursor_damage_tracker,
+            last_cursor_location,
+            ..
+        } = self
+        {
+            *damage_tracker = None;
+            *cursor_damage_tracker = None;
+            *last_cursor_location = None;
+        }
+    }
+
     fn pending_size(&self) -> Option<Size<u32, Physical>> {
         match self {
             CastState::ResizePending { pending_size } => Some(*pending_size),
@@ -1943,6 +2002,65 @@ fn clear_shmbuf(buffer: &Shmbuf) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resuming_restores_static_scene_damage_without_renegotiating() {
+        use smithay::backend::renderer::element::Kind;
+
+        use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+
+        let buffer = SolidColorBuffer::new((16.0, 8.0), [1.0, 0.0, 0.0, 1.0]);
+        let elements = [SolidColorRenderElement::from_buffer(
+            &buffer,
+            (0.0, 0.0),
+            1.0,
+            Kind::Unspecified,
+        )];
+        let size = Size::from((16, 8));
+        let mut state = CastState::Ready {
+            size,
+            alpha: false,
+            dma_negotiation: Some(DmaNegotiation {
+                modifier: Modifier::Linear,
+                plane_count: 1,
+            }),
+            damage_tracker: None,
+            cursor_damage_tracker: Some(OutputDamageTracker::new((16, 8), 1.0, Transform::Normal)),
+            last_cursor_location: Some(Point::from((4, 4))),
+        };
+        let damaged = |state: &mut CastState| {
+            let CastState::Ready { damage_tracker, .. } = state else {
+                unreachable!()
+            };
+            damage_tracker
+                .get_or_insert_with(|| OutputDamageTracker::new((16, 8), 1.0, Transform::Normal))
+                .damage_output(1, &elements)
+                .unwrap()
+                .0
+                .is_some()
+        };
+        assert!(damaged(&mut state));
+        assert!(!damaged(&mut state));
+        state.invalidate_damage();
+        assert!(damaged(&mut state));
+        assert!(!damaged(&mut state));
+        let CastState::Ready {
+            size: actual,
+            alpha,
+            dma_negotiation,
+            cursor_damage_tracker,
+            last_cursor_location,
+            ..
+        } = state
+        else {
+            panic!("negotiation state changed")
+        };
+        assert_eq!(actual, size);
+        assert!(!alpha);
+        assert_eq!(dma_negotiation.unwrap().modifier, Modifier::Linear);
+        assert!(cursor_damage_tracker.is_none());
+        assert!(last_cursor_location.is_none());
+    }
 
     #[test]
     fn shm_layout_uses_spa_representable_dimensions() {
