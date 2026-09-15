@@ -70,6 +70,7 @@ const SHM_BYTES_PER_PIXEL: usize = 4;
 
 mod dmabuf_layout;
 mod modifier_selection;
+use recovery::DmaRecovery;
 
 const CURSOR_FORMAT: spa_video_format = SPA_VIDEO_FORMAT_BGRA;
 const CURSOR_BPP: u32 = 4;
@@ -117,6 +118,7 @@ pub struct Cast {
 /// Mutable `Cast` state shared with PipeWire callbacks.
 #[derive(Debug)]
 struct CastInner {
+    dma_recovery: DmaRecovery,
     is_active: bool,
     node_id: Option<u32>,
     state: CastState,
@@ -350,6 +352,8 @@ macro_rules! make_params {
     };
 }
 
+mod recovery;
+
 impl PipeWire {
     pub fn new(
         event_loop: LoopHandle<'static, State>,
@@ -455,6 +459,7 @@ impl PipeWire {
 
         // Like in good old wayland-rs times...
         let inner = Rc::new(RefCell::new(CastInner {
+            dma_recovery: DmaRecovery::default(),
             is_active: false,
             node_id: None,
             state: CastState::ResizePending { pending_size },
@@ -502,8 +507,9 @@ impl PipeWire {
                                 inner.is_active = false;
                             }
                             StreamState::Error(_) => {
-                                if inner.is_active {
+                                if inner.is_active || inner.dma_recovery == DmaRecovery::Pending {
                                     inner.is_active = false;
+                                    inner.dma_recovery = DmaRecovery::Failed;
                                     stop_cast();
                                 }
                             }
@@ -521,6 +527,7 @@ impl PipeWire {
                     let stop_cast = stop_cast.clone();
                     let gbm = gbm.clone();
                     let formats = formats.clone();
+                    let event_loop = self.event_loop.clone();
                     move |stream, (), id, pod| {
                         let id = ParamType::from_raw(id);
                         trace!(%stream_id, ?id, "param_changed");
@@ -598,6 +605,9 @@ impl PipeWire {
                         let object = pod.as_object().unwrap();
                         let prop_modifier =
                             object.find_prop(spa::utils::Id(FormatProperties::VideoModifier.0));
+                        if prop_modifier.is_some() && inner.dma_recovery != DmaRecovery::Available {
+                            return;
+                        }
 
                         match prop_modifier {
                             Some(prop_modifier)
@@ -637,7 +647,11 @@ impl PipeWire {
                                     Ok(x) => x,
                                     Err(err) => {
                                         warn!("couldn't find preferred modifier: {err:?}");
-                                        stop_cast();
+                                        recovery::schedule_shm_fallback(
+                                            &event_loop,
+                                            inner,
+                                            stream_id,
+                                        );
                                         return;
                                     }
                                 };
@@ -749,7 +763,11 @@ impl PipeWire {
                                         Ok(x) => x,
                                         Err(err) => {
                                             warn!("test allocation failed: {err:?}");
-                                            stop_cast();
+                                            recovery::schedule_shm_fallback(
+                                                &event_loop,
+                                                inner,
+                                                stream_id,
+                                            );
                                             return;
                                         }
                                     };
@@ -891,10 +909,39 @@ impl PipeWire {
                 .add_buffer({
                     let inner = inner.clone();
                     let stop_cast = stop_cast.clone();
+                    let event_loop = self.event_loop.clone();
                     move |stream, (), buffer| {
                         let _span = debug_span!("add_buffer", %stream_id).entered();
 
-                        match unsafe { inner.borrow_mut().on_add_buffer(gbm.as_ref(), buffer) } {
+                        let result = {
+                            let mut inner = inner.borrow_mut();
+                            let dma = matches!(
+                                inner.state,
+                                CastState::Ready {
+                                    dma_negotiation: Some(_),
+                                    ..
+                                }
+                            );
+                            if dma && inner.dma_recovery != DmaRecovery::Available {
+                                return;
+                            }
+                            let result = unsafe { inner.on_add_buffer(gbm.as_ref(), buffer) };
+                            if dma && result.is_err() {
+                                warn!("DMA-BUF allocation failed: {:?}", result.as_ref().err());
+                                recovery::schedule_shm_fallback(&event_loop, &mut inner, stream_id);
+                                return;
+                            }
+                            if result.is_ok()
+                                && !dma
+                                && matches!(inner.state, CastState::Ready { .. })
+                                && inner.dma_recovery == DmaRecovery::Pending
+                            {
+                                inner.dma_recovery = DmaRecovery::ShmOnly;
+                                inner.is_active = stream.state() == StreamState::Streaming;
+                            }
+                            result
+                        };
+                        match result {
                             Ok(redraw) => {
                                 // During size re-negotiation, the stream sometimes just keeps
                                 // running, in which case we may need to force a redraw once we got
@@ -957,7 +1004,12 @@ impl PipeWire {
 
 impl Cast {
     pub fn is_active(&self) -> bool {
-        self.inner.borrow().is_active
+        let inner = self.inner.borrow();
+        inner.is_active
+            && matches!(
+                inner.dma_recovery,
+                DmaRecovery::Available | DmaRecovery::ShmOnly
+            )
     }
 
     pub fn node_id(&self) -> Option<u32> {
@@ -986,13 +1038,16 @@ impl Cast {
             pending_size: new_size,
         };
 
-        make_params!(
-            params,
-            &self.formats,
-            new_size,
-            inner.refresh,
-            self.offer_alpha
-        );
+        let refresh = inner.refresh;
+        let empty = FormatSet::default();
+        let formats = if inner.dma_recovery == DmaRecovery::Available {
+            &self.formats
+        } else {
+            &empty
+        };
+        drop(inner);
+
+        make_params!(params, formats, new_size, refresh, self.offer_alpha);
         self.stream
             .update_params(&mut params)
             .context("error updating stream params")?;
@@ -1012,6 +1067,10 @@ impl Cast {
         inner.refresh = refresh;
 
         let size = inner.state.expected_format_size();
+        if inner.dma_recovery != DmaRecovery::Available {
+            self.formats = FormatSet::default();
+        }
+        drop(inner);
         make_params!(params, &self.formats, size, refresh, self.offer_alpha);
         self.stream
             .update_params(&mut params)
@@ -1154,6 +1213,14 @@ impl Cast {
                 // signalled), then without a sync fd we cannot schedule a queue upon its
                 // completion, effectively going stuck. It's better to queue an incomplete buffer
                 // than getting stuck.
+                // Keep unfinished contents owned until renegotiation removes the old pool;
+                // do not block the compositor on a fence that could not be exported.
+                if !sync_point.is_reached() {
+                    warn!("could not export DMA-BUF rendering fence");
+                    inner.rendering_buffers.push((pw_buffer, sync_point));
+                    recovery::schedule_shm_fallback(&self.event_loop, &mut inner, self.stream_id);
+                    return;
+                }
                 sync_point = SyncPoint::signaled();
                 None
             }
@@ -1172,17 +1239,34 @@ impl Cast {
                 trace!("scheduling buffer to queue");
                 let stream_id = self.stream_id;
                 let source = Generic::new(sync_fd, Interest::READ, Mode::OneShot);
-                self.event_loop
-                    .insert_source(source, move |_, _, state| {
-                        for cast in &mut state.niri.casting.casts {
-                            if cast.stream_id == stream_id {
-                                cast.queue_completed_buffers();
-                            }
+                if let Err(err) = self.event_loop.insert_source(source, move |_, _, state| {
+                    for cast in &mut state.niri.casting.casts {
+                        if cast.stream_id == stream_id {
+                            cast.queue_completed_buffers();
                         }
+                    }
 
-                        Ok(PostAction::Remove)
-                    })
-                    .unwrap();
+                    Ok(PostAction::Remove)
+                }) {
+                    warn!("error registering DMA-BUF fence: {err}");
+                    let mut inner = self.inner.borrow_mut();
+                    let ready = inner
+                        .rendering_buffers
+                        .iter()
+                        .find(|(buffer, _)| *buffer == pw_buffer)
+                        .is_some_and(|(_, sync)| sync.is_reached());
+                    if !ready {
+                        recovery::schedule_shm_fallback(
+                            &self.event_loop,
+                            &mut inner,
+                            self.stream_id,
+                        );
+                    }
+                    drop(inner);
+                    if ready {
+                        self.queue_completed_buffers();
+                    }
+                }
             }
         }
     }
@@ -1321,7 +1405,15 @@ impl Cast {
                 }
                 Err(err) => {
                     warn!("error rendering to buffer: {err:?}");
+                    let dma = (*(*spa_buffer).datas).type_ == DataType::DmaBuf.as_raw();
                     return_unused_buffer(&self.stream, pw_buffer);
+                    if dma {
+                        recovery::schedule_shm_fallback(
+                            &self.event_loop,
+                            &mut self.inner.borrow_mut(),
+                            self.stream_id,
+                        );
+                    }
                     false
                 }
             }
@@ -1381,7 +1473,15 @@ impl Cast {
                 }
                 Err(err) => {
                     warn!("error clearing buffer: {err:?}");
+                    let dma = (*(*spa_buffer).datas).type_ == DataType::DmaBuf.as_raw();
                     return_unused_buffer(&self.stream, pw_buffer);
+                    if dma {
+                        recovery::schedule_shm_fallback(
+                            &self.event_loop,
+                            &mut self.inner.borrow_mut(),
+                            self.stream_id,
+                        );
+                    }
                     false
                 }
             }
