@@ -1825,9 +1825,9 @@ unsafe fn mark_buffer_as_good(pw_buffer: NonNull<pw_buffer>, sequence: &mut u64,
             //
             // https://docs.pipewire.org/page_dma_buf.html
             //
-            // However, OBS checks for size != 0 as a workaround for old compositor versions,
-            // so we set it to 1.
-            // Restore each plane's full extent, including modifier-specific auxiliary data.
+            // However, OBS checks for size != 0 as a workaround for old compositor versions.
+            // Restore the nonzero extent from each plane's offset to the end of its backing
+            // storage, including modifier-specific auxiliary data.
             for data in
                 slice::from_raw_parts_mut((*spa_buffer).datas, (*spa_buffer).n_datas as usize)
             {
