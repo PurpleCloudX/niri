@@ -1342,7 +1342,7 @@ impl Cast {
                         .map(|x| (x, SharingBuf::Dma))
                 }
                 x if x == DataType::MemFd.as_raw() => {
-                    let shmbuf = inner_.shmbufs[&fd].clone();
+                    let shmbuf = &inner_.shmbufs[&fd];
 
                     let fourcc = if alpha {
                         Fourcc::Argb8888
@@ -1350,8 +1350,8 @@ impl Cast {
                         Fourcc::Xrgb8888
                     };
 
-                    render_to_shmbuf(renderer, damage_tracker, &shmbuf, fourcc, elements, states)
-                        .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf)))
+                    render_to_shmbuf(renderer, damage_tracker, shmbuf, fourcc, elements, states)
+                        .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
                 }
                 _ => Err(anyhow::anyhow!(
                     "unknown data type in dequeue_buffer_and_render"
@@ -1414,8 +1414,10 @@ impl Cast {
                     clear_dmabuf(renderer, dmabuf).map(|x| (x, SharingBuf::Dma))
                 }
                 x if x == DataType::MemFd.as_raw() => {
-                    let shmbuf = self.inner.borrow().shmbufs[&fd].clone();
-                    clear_shmbuf(&shmbuf).map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf)))
+                    let inner = self.inner.borrow();
+                    let shmbuf = &inner.shmbufs[&fd];
+                    clear_shmbuf(shmbuf)
+                        .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
                 }
                 _ => Err(anyhow::anyhow!(
                     "unknown data type in dequeue_buffer_and_clear"
@@ -1684,11 +1686,11 @@ fn allocate_dmabuf(
     Ok(dmabuf)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Shmbuf {
-    fd: Rc<OwnedFd>,
+    fd: OwnedFd,
     layout: ShmLayout,
-    mapping: Rc<ShmMapping>,
+    mapping: ShmMapping,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1720,7 +1722,7 @@ impl ShmLayout {
 
 enum SharingBuf {
     Dma,
-    Shm(Shmbuf),
+    Shm(ShmLayout),
 }
 
 fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbuf> {
@@ -1733,9 +1735,9 @@ fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbuf> {
     ftruncate(&fd, layout.size.into()).context("error setting size of the fd")?;
     fcntl_add_seals(&fd, SealFlags::SEAL | SealFlags::SHRINK | SealFlags::GROW)
         .context("error sealing the fd")?;
-    let mapping = Rc::new(ShmMapping::new(fd.as_fd(), layout.size_usize())?);
+    let mapping = ShmMapping::new(fd.as_fd(), layout.size_usize())?;
     Ok(Shmbuf {
-        fd: fd.into(),
+        fd,
         layout,
         mapping,
     })
@@ -1777,8 +1779,8 @@ unsafe fn mark_buffer_as_good(pw_buffer: NonNull<pw_buffer>, sequence: &mut u64,
             // Clear the corrupted flag we may have set before.
             (*chunk).flags = SPA_CHUNK_FLAG_NONE as i32;
         }
-        SharingBuf::Shm(shmbuf) => {
-            (*chunk).size = shmbuf.layout.size;
+        SharingBuf::Shm(layout) => {
+            (*chunk).size = layout.size;
             (*chunk).flags = SPA_CHUNK_FLAG_NONE as i32;
         }
     }
@@ -2052,32 +2054,26 @@ mod tests {
     }
 
     #[test]
-    fn shm_mapping_survives_buffer_clones_and_rejects_invalid_copies() {
+    fn shm_mapping_rejects_invalid_copies_and_clears_contents() {
         use std::os::unix::fs::FileExt;
 
         let buffer = allocate_shmbuf(Size::from((4, 2))).unwrap();
-        let cloned = buffer.clone();
-        assert!(Rc::ptr_eq(&buffer.mapping, &cloned.mapping));
         let file = std::fs::File::from(buffer.fd.try_clone().unwrap());
-        let mapping = Rc::downgrade(&buffer.mapping);
-        drop(buffer);
 
         for value in [3, 7] {
-            cloned.mapping.copy_frame(&[value; 32]).unwrap();
+            buffer.mapping.copy_frame(&[value; 32]).unwrap();
             for len in [0, 31, 33] {
-                assert!(cloned.mapping.copy_frame(&[0; 33][..len]).is_err());
+                assert!(buffer.mapping.copy_frame(&[0; 33][..len]).is_err());
             }
             let mut bytes = [0; 32];
             file.read_exact_at(&mut bytes, 0).unwrap();
             assert_eq!(bytes, [value; 32]);
         }
-        assert!(ftruncate(&*cloned.fd, 0).is_err());
-        assert!(ftruncate(&*cloned.fd, 64).is_err());
-        clear_shmbuf(&cloned).unwrap();
+        assert!(ftruncate(&buffer.fd, 0).is_err());
+        assert!(ftruncate(&buffer.fd, 64).is_err());
+        clear_shmbuf(&buffer).unwrap();
         let mut bytes = [1; 32];
         file.read_exact_at(&mut bytes, 0).unwrap();
         assert_eq!(bytes, [0; 32]);
-        drop(cloned);
-        assert!(mapping.upgrade().is_none());
     }
 }
